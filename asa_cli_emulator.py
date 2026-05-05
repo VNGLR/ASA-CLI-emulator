@@ -4,6 +4,7 @@ import ipaddress
 import os
 import platform
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -436,6 +437,7 @@ class AsaCli:
             self._add_command(root, ["show", "memory"], "Display memory utilization", self._show_memory)
             self._add_command(root, ["show", "mem"], "Display memory utilization", self._show_memory)
             self._add_command(root, ["show", "tech"], "Display technical support information", self._show_tech)
+            self._add_command(root, ["show", "tech-support"], "Display technical support information", self._show_tech)
             self._add_command(root, ["show", "version"], "System software information", self._show_version)
             self._add_command(root, ["show", "running-config"], "Current operating configuration", self._show_running_config)
             self._add_command(root, ["show", "inventory"], "Hardware and platform inventory", self._show_inventory)
@@ -1359,33 +1361,233 @@ class AsaCli:
             print(f"route {route.interface_name} {route.destination} {route.mask} {route.gateway} {route.metric}")
         print("service-policy global_policy global")
 
-    def _show_tech(self) -> None:
-        print("------------------ show tech-support ------------------")
-        print(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print()
-        print("---------- show version ----------")
-        self._show_version()
-        print()
-        print("---------- show inventory ----------")
-        self._show_inventory()
-        print()
-        print("---------- show cpu ----------")
-        self._show_cpu()
-        print()
-        print("---------- show memory ----------")
-        self._show_memory()
-        print()
-        print("---------- show system ----------")
-        self._show_system()
-        print()
-        print("---------- show interface ip brief ----------")
-        self._show_interface_ip_brief()
-        print()
-        print("---------- show route ----------")
-        self._show_route()
-        print()
-        print("---------- show running-config ----------")
+    def _show_clock_detail(self) -> None:
+        now = datetime.now().astimezone()
+        print(now.strftime("%H:%M:%S.%f")[:-3] + " " + now.tzname() + " " + now.strftime("%a %b %d %Y"))
+        print(f"Time source is Windows system clock")
+        print(f"UTC offset is {now.strftime('%z')}")
+
+    def _show_startup_config(self) -> None:
+        print(": Startup configuration is emulated from the current running configuration")
+        print(": A persistent startup-config store has not been configured")
+        print("!")
         self._show_running_config()
+
+    def _show_module_detail(self) -> None:
+        print('Mod  Card Type                                    Model              Serial No.')
+        print(f'1    Windows ASA CLI Emulator Host                {get_model()[:18]:18} {get_serial_number()}')
+        print()
+        print('Mod  MAC Address Range                 Hw Version   Fw Version   Sw Version')
+        first_mac = next((interface.mac_address for interface in self.interfaces.values()), "unassigned")
+        print(f'1    {first_mac:33} 1.0          N/A          9.18(Emulated)')
+
+    def _show_interfaces_detail(self) -> None:
+        if not self.interfaces:
+            print("No interfaces discovered")
+            return
+
+        for interface in self.interfaces.values():
+            status = "administratively down" if interface.shutdown else "up"
+            protocol = "down" if interface.shutdown else "up"
+            ip_address = interface.effective_ip() or "unassigned"
+            mask = interface.configured_mask or ("DHCP" if interface.dhcp_enabled else "255.255.255.255")
+            print(f"Interface {interface.asa_name} \"{self._display_interface_name(interface)}\", is {status}, line protocol is {protocol}")
+            print(f"  Hardware is Windows adapter, BW 1000000 Kbit, DLY 10 usec")
+            print(f"  Description: {interface.description}")
+            print(f"  MAC address {interface.mac_address}, MTU 1500")
+            print(f"  IP address {ip_address}, subnet mask {mask}")
+            print(f"  Method {interface.effective_method()}, security level {interface.security_level if interface.security_level is not None else 'unset'}")
+            print("  Input queue: 0/2000/0/0 (size/max/drops/flushes); Total output drops: 0")
+            print("  5 minute input rate 0 bits/sec, 0 packets/sec")
+            print("  5 minute output rate 0 bits/sec, 0 packets/sec")
+            print()
+
+    def _show_ip_address(self) -> None:
+        print("System IP Addresses:")
+        for interface in self.interfaces.values():
+            ip_address = interface.effective_ip() or "unassigned"
+            method = interface.effective_method()
+            print(f"  {self._display_interface_name(interface):18} {ip_address:15} {method}")
+
+    def _show_route_summary(self) -> None:
+        connected = sum(1 for interface in self.interfaces.values() if interface.effective_ip() and not interface.shutdown)
+        static = sum(1 for route in self.static_routes if route.metric != 0)
+        print("Route Source    Networks    Subnets     Overhead    Memory (bytes)")
+        print(f"connected       {connected:<11}0           0           {connected * 128}")
+        print(f"static          {static:<11}0           0           {static * 128}")
+        print(f"total           {connected + static:<11}0           0           {(connected + static) * 128}")
+
+    def _show_arp(self) -> None:
+        output = run_command(["arp", "-a"])
+        if output:
+            print(output)
+        else:
+            print("No ARP entries available")
+
+    def _show_conn_count(self) -> None:
+        print("0 in use, 0 most used")
+        print("TCP conn count: 0")
+        print("UDP conn count: 0")
+
+    def _show_xlate_count(self) -> None:
+        print("0 in use, 0 most used")
+
+    def _show_access_list(self) -> None:
+        print("No access-list entries configured")
+
+    def _show_nat_detail(self) -> None:
+        print("Manual NAT Policies (Section 1)")
+        print("  No rules configured")
+        print("Auto NAT Policies (Section 2)")
+        print("  No rules configured")
+        print("After-auto NAT Policies (Section 3)")
+        print("  No rules configured")
+
+    def _show_service_policy(self) -> None:
+        print("Global policy:")
+        print("  Service-policy: global_policy")
+        print("    Class-map: inspection_default")
+        print("      Inspect: dns, packet 0, drop 0, reset-drop 0")
+
+    def _show_processes_cpu(self) -> None:
+        print("PC         Thread       5Sec     1Min     5Min   Process")
+        snapshot = get_cpu_snapshot()
+        usage = snapshot.get("usage_percent", 0.0)
+        print(f"0x00000000 0x00000001  {usage:5.1f}%   N/A      N/A    Windows kernel")
+        print("0x00000000 0x00000002    0.0%   N/A      N/A    ASA CLI emulator")
+
+    def _show_processes_memory(self) -> None:
+        output = run_command(["tasklist", "/FO", "TABLE"])
+        if not output or "access denied" in output.lower():
+            output = powershell(
+                "Get-Process | Sort-Object WorkingSet64 -Descending | "
+                "Select-Object -First 20 ProcessName,Id,@{Name='WorkingSetMB';Expression={[math]::Round($_.WorkingSet64 / 1MB, 1)}} | "
+                "Format-Table -AutoSize | Out-String"
+            )
+        output = clean_command_output(output) or output
+        if not output or "access denied" in output.lower():
+            print("Process memory information unavailable")
+            return
+        lines = output.splitlines()
+        for line in lines[:22]:
+            print(line)
+        if len(lines) > 22:
+            print(f"... {len(lines) - 22} additional Windows processes omitted")
+
+    def _show_blocks(self) -> None:
+        print("SIZE    MAX    LOW    CNT")
+        print("4       100    100    100")
+        print("80      500    500    500")
+        print("256     500    500    500")
+        print("1550    1000   1000   1000")
+
+    def _show_filesystems(self) -> None:
+        root = os.path.abspath(os.sep)
+        usage = shutil.disk_usage(root)
+        print("File Systems:")
+        print("  Size(b)       Free(b)       Type  Flags  Prefixes")
+        print(f"  {usage.total:>16}  {usage.free:>16}  disk  rw     disk0: flash:")
+        print()
+        print("Directory of disk0:/")
+        for entry in sorted(os.scandir(os.getcwd()), key=lambda item: item.name.lower()):
+            entry_type = "d" if entry.is_dir() else "-"
+            size = 0 if entry.is_dir() else entry.stat().st_size
+            print(f"{entry_type} {size:>10}  {entry.name}")
+
+    def _show_logging_tail(self) -> None:
+        print("Syslog logging: enabled (emulated)")
+        print("Buffer logging: level debugging, 5 messages logged")
+        print(f"%ASA-6-302013: Built emulated management connection for user {self.username}")
+        print("%ASA-6-302014: Teardown emulated management connection")
+        print("%ASA-5-111008: User executed the show tech-support command")
+        print("%ASA-4-411001: Line protocol state changes are reflected from Windows adapters")
+        print("%ASA-6-199013: Emulator diagnostic collection complete")
+
+    def _show_resource_usage(self) -> None:
+        print("Resource                 Current        Peak      Limit        Denied")
+        print(f"Interfaces               {len(self.interfaces):<14}{len(self.interfaces):<10}N/A          0")
+        route_count = sum(1 for route in self.static_routes if route.metric != 0)
+        print(f"Routes                   {route_count:<14}{route_count:<10}N/A          0")
+        print("Conns                    0              0         N/A          0")
+        print("Xlates                   0              0         N/A          0")
+        print("Syslogs                  5              5         N/A          0")
+
+    def _show_failover(self) -> None:
+        print("Failover Off")
+        print("This host is operating as a standalone ASA emulator")
+
+    def _show_vpn_stats(self) -> None:
+        print("IKEv1 SAs: 0")
+        print("IKEv2 SAs: 0")
+        print("IPsec SAs: 0")
+        print("SSL VPN sessions: 0")
+
+    def _show_asp_drop(self) -> None:
+        print("Frame drop:")
+        print("  No ASP drop counters are available in the Windows emulator")
+
+    def _show_environment(self) -> None:
+        print("Power Supply: N/A")
+        print("Temperature: N/A")
+        print("Fans: N/A")
+        print(f"Host platform: {get_manufacturer()} {get_model()}")
+
+    def _show_history(self) -> None:
+        if not self.history:
+            print("No command history")
+            return
+        for index, command in enumerate(self.history[-20:], start=1):
+            print(f"{index:>3}  {command}")
+
+    def _tech_section(self, command: str, action: Callable[[], None]) -> None:
+        print()
+        print("=" * 72)
+        print(f"{self.hostname}# {command}")
+        print("=" * 72)
+        action()
+
+    def _show_tech(self) -> None:
+        print("Cisco Adaptive Security Appliance show tech-support")
+        print("Output captured by ASA CLI emulator for Windows")
+        print(f"Generated: {datetime.now().astimezone().isoformat(sep=' ', timespec='seconds')}")
+        print("Passwords and secret values are removed by default.")
+
+        sections: List[Tuple[str, Callable[[], None]]] = [
+            ("show clock detail", self._show_clock_detail),
+            ("show version", self._show_version),
+            ("show inventory", self._show_inventory),
+            ("show module detail", self._show_module_detail),
+            ("show running-config", self._show_running_config),
+            ("show startup-config", self._show_startup_config),
+            ("show interface ip brief", self._show_interface_ip_brief),
+            ("show interfaces", self._show_interfaces_detail),
+            ("show ip address", self._show_ip_address),
+            ("show route", self._show_route),
+            ("show route-summary", self._show_route_summary),
+            ("show arp", self._show_arp),
+            ("show conn count", self._show_conn_count),
+            ("show xlate count", self._show_xlate_count),
+            ("show access-list", self._show_access_list),
+            ("show nat detail", self._show_nat_detail),
+            ("show service-policy", self._show_service_policy),
+            ("show cpu detail", self._show_cpu),
+            ("show processes cpu-usage non-zero sorted", self._show_processes_cpu),
+            ("show memory detail", self._show_memory),
+            ("show processes memory", self._show_processes_memory),
+            ("show blocks", self._show_blocks),
+            ("dir all-filesystems", self._show_filesystems),
+            ("show logging", self._show_logging_tail),
+            ("show resource usage count all 1", self._show_resource_usage),
+            ("show failover", self._show_failover),
+            ("show vpn-sessiondb summary", self._show_vpn_stats),
+            ("show crypto ikev1 stats", self._show_vpn_stats),
+            ("show asp drop", self._show_asp_drop),
+            ("show environment", self._show_environment),
+            ("show history", self._show_history),
+        ]
+
+        for command, action in sections:
+            self._tech_section(command, action)
 
     @staticmethod
     def _asa_interface_name(index: int, source_name: str) -> str:
