@@ -344,6 +344,8 @@ class AsaCli:
         self.interfaces = self._build_emulated_interfaces(self.base_interfaces)
         self.current_interface: Optional[str] = None
         self.static_routes: List[StaticRoute] = self._build_default_routes()
+        self.history: List[str] = []
+        self._last_input_width = 0
         self.user_tree, self.enabled_tree, self.config_tree, self.interface_tree = self._build_command_trees()
 
     @staticmethod
@@ -502,40 +504,93 @@ class AsaCli:
             return input(self.prompt)
 
         buffer = ""
+        cursor = 0
+        history_index = len(self.history)
         print(self.prompt, end="", flush=True)
+        self._last_input_width = len(self.prompt)
         while True:
             char = msvcrt.getwch()
             if char in ("\r", "\n"):
                 print()
+                if buffer.strip() and (not self.history or self.history[-1] != buffer):
+                    self.history.append(buffer)
                 return buffer
             if char == "\t":
-                buffer = self._handle_tab(buffer)
+                buffer, cursor = self._handle_tab(buffer, cursor)
                 continue
             if char in ("\b", "\x7f"):
-                if buffer:
-                    buffer = buffer[:-1]
-                    print("\b \b", end="", flush=True)
+                if cursor > 0:
+                    buffer = buffer[: cursor - 1] + buffer[cursor:]
+                    cursor -= 1
+                    self._redraw_input(buffer, cursor)
                 continue
             if char == "\x03":
                 raise KeyboardInterrupt
             if char in ("\x00", "\xe0"):
-                msvcrt.getwch()
+                key = msvcrt.getwch()
+                if key == "H" and self.history:
+                    history_index = max(0, history_index - 1)
+                    buffer = self.history[history_index]
+                    cursor = len(buffer)
+                    self._redraw_input(buffer, cursor)
+                elif key == "P" and self.history:
+                    history_index = min(len(self.history), history_index + 1)
+                    buffer = "" if history_index == len(self.history) else self.history[history_index]
+                    cursor = len(buffer)
+                    self._redraw_input(buffer, cursor)
+                elif key == "K" and cursor > 0:
+                    cursor -= 1
+                    print("\b", end="", flush=True)
+                elif key == "M" and cursor < len(buffer):
+                    print(buffer[cursor], end="", flush=True)
+                    cursor += 1
+                elif key == "S" and cursor < len(buffer):
+                    buffer = buffer[:cursor] + buffer[cursor + 1:]
+                    self._redraw_input(buffer, cursor)
+                elif key == "G":
+                    while cursor > 0:
+                        print("\b", end="", flush=True)
+                        cursor -= 1
+                elif key == "O":
+                    while cursor < len(buffer):
+                        print(buffer[cursor], end="", flush=True)
+                        cursor += 1
                 continue
             if char.isprintable():
-                buffer += char
-                print(char, end="", flush=True)
+                buffer = buffer[:cursor] + char + buffer[cursor:]
+                cursor += len(char)
+                self._redraw_input(buffer, cursor)
 
-    def _handle_tab(self, buffer: str) -> str:
-        completed, suggestions = self._complete_line(buffer)
-        if completed != buffer:
-            addition = completed[len(buffer):]
-            print(addition, end="", flush=True)
-            return completed
+    def _redraw_input(self, buffer: str, cursor: int) -> None:
+        line = self.prompt + buffer
+        clear_width = max(self._last_input_width, len(line)) + 4
+        print("\r" + " " * clear_width + "\r" + line, end="", flush=True)
+        self._last_input_width = len(line)
+        backtrack = len(buffer) - cursor
+        if backtrack:
+            print("\b" * backtrack, end="", flush=True)
+
+    def _handle_tab(self, buffer: str, cursor: int) -> Tuple[str, int]:
+        prefix = buffer[:cursor]
+        suffix = buffer[cursor:]
+        completed, suggestions = self._complete_line(prefix)
+        if completed != prefix:
+            new_buffer = completed + suffix
+            new_cursor = len(completed)
+            if suffix:
+                self._redraw_input(new_buffer, new_cursor)
+            else:
+                addition = completed[len(prefix):]
+                print(addition, end="", flush=True)
+            return new_buffer, new_cursor
         if suggestions:
             print()
             self._print_columns(suggestions)
             print(self.prompt + buffer, end="", flush=True)
-        return buffer
+            backtrack = len(buffer) - cursor
+            if backtrack:
+                print("\b" * backtrack, end="", flush=True)
+        return buffer, cursor
 
     def _complete_line(self, buffer: str) -> Tuple[str, List[str]]:
         words, trailing_space = split_words(buffer)
@@ -568,6 +623,9 @@ class AsaCli:
             if node.children[completed_word].children:
                 completed += " "
             return completed, [completed_word]
+        common = os.path.commonprefix(options)
+        if len(common) > len(current):
+            return " ".join(path_words + [common]), options
         return buffer, options
 
     def _dispatch_line(self, line: str) -> bool:
@@ -850,6 +908,9 @@ class AsaCli:
         if len(matches) == 1:
             completed = " ".join(words[:-1] + [matches[0]])
             return (completed + " " if append_space else completed), matches
+        common = os.path.commonprefix(matches)
+        if len(common) > len(current):
+            return " ".join(words[:-1] + [common]), matches
         return " ".join(words), matches
 
     def _complete_value_command(
@@ -874,6 +935,9 @@ class AsaCli:
             if len(matches) == 1:
                 completed = " ".join(words[:-1] + [matches[0]])
                 return completed + " ", matches
+            common = os.path.commonprefix(matches)
+            if len(common) > len(current):
+                return " ".join(words[:-1] + [common]), matches
             return buffer, matches
         return None
 
