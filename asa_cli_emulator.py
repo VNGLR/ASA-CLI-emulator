@@ -1,5 +1,6 @@
 import ctypes
 import getpass
+import ipaddress
 import os
 import platform
 import re
@@ -31,6 +32,23 @@ def run_command(command: List[str]) -> str:
         return f"Unable to run {' '.join(command)}: {exc}"
 
 
+def run_live_command(command: List[str]) -> Tuple[bool, str]:
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError as exc:
+        return False, str(exc)
+
+    output = (completed.stdout or completed.stderr or "").strip()
+    return completed.returncode == 0, output
+
+
 def powershell(command: str) -> str:
     return run_command(
         [
@@ -52,6 +70,20 @@ def clean_command_output(value: str) -> str:
     if "access denied" in lowered or "fullyqualifiederrorid" in lowered or "exception" in lowered:
         return ""
     return text
+
+
+def is_admin() -> bool:
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except OSError:
+        return False
+
+
+def mask_to_prefix(mask: str) -> Optional[int]:
+    try:
+        return ipaddress.IPv4Network(f"0.0.0.0/{mask}").prefixlen
+    except ValueError:
+        return None
 
 
 @dataclass
@@ -268,14 +300,51 @@ class CommandNode:
     children: Dict[str, "CommandNode"] = field(default_factory=dict)
 
 
+@dataclass
+class EmulatedInterface:
+    asa_name: str
+    windows_name: str
+    mac_address: str
+    live_ipv4: Optional[str]
+    live_method: str
+    description: str
+    nameif: Optional[str] = None
+    security_level: Optional[int] = None
+    configured_ip: Optional[str] = None
+    configured_mask: Optional[str] = None
+    dhcp_enabled: bool = False
+    dhcp_setroute: bool = False
+    shutdown: bool = False
+
+    def effective_ip(self) -> Optional[str]:
+        return self.configured_ip or self.live_ipv4
+
+    def effective_method(self) -> str:
+        if self.dhcp_enabled:
+            return "DHCP"
+        return "manual" if self.configured_ip else self.live_method
+
+
+@dataclass
+class StaticRoute:
+    interface_name: str
+    destination: str
+    mask: str
+    gateway: str
+    metric: int = 1
+
+
 class AsaCli:
     def __init__(self) -> None:
         self.hostname = self._sanitize_hostname(get_hostname())
         self.enabled = False
-        self.config_mode = False
-        self.interfaces = parse_ipconfig()
+        self.config_submode = "exec"
         self.username = getpass.getuser()
-        self.user_tree, self.enabled_tree, self.config_tree = self._build_command_trees()
+        self.base_interfaces = parse_ipconfig()
+        self.interfaces = self._build_emulated_interfaces(self.base_interfaces)
+        self.current_interface: Optional[str] = None
+        self.static_routes: List[StaticRoute] = self._build_default_routes()
+        self.user_tree, self.enabled_tree, self.config_tree, self.interface_tree = self._build_command_trees()
 
     @staticmethod
     def _sanitize_hostname(name: str) -> str:
@@ -284,16 +353,52 @@ class AsaCli:
 
     @property
     def prompt(self) -> str:
-        if self.config_mode:
+        if self.config_submode == "config-if":
+            return f"{self.hostname}(config-if)# "
+        if self.config_submode == "config":
             return f"{self.hostname}(config)# "
         if self.enabled:
             return f"{self.hostname}# "
         return f"{self.hostname}> "
 
-    def _build_command_trees(self) -> Tuple[CommandNode, CommandNode, CommandNode]:
+    def _build_emulated_interfaces(self, interfaces: List[InterfaceInfo]) -> Dict[str, EmulatedInterface]:
+        mapped: Dict[str, EmulatedInterface] = {}
+        for index, interface in enumerate(interfaces, start=1):
+            asa_name = self._asa_interface_name(index, interface.name)
+            live_ip = interface.ipv4_addresses[0] if interface.ipv4_addresses else None
+            live_method = "DHCP" if (interface.dhcp_enabled or "").lower() == "yes" else "manual"
+            mapped[asa_name.lower()] = EmulatedInterface(
+                asa_name=asa_name,
+                windows_name=interface.name,
+                mac_address=interface.mac_address,
+                live_ipv4=live_ip,
+                live_method=live_method,
+                description=f"Windows adapter: {interface.name}",
+                dhcp_enabled=live_method == "DHCP",
+                shutdown=interface.status == "administratively down",
+            )
+        return mapped
+
+    def _build_default_routes(self) -> List[StaticRoute]:
+        routes: List[StaticRoute] = []
+        for interface in self.interfaces.values():
+            if interface.effective_ip():
+                routes.append(
+                    StaticRoute(
+                        interface_name=interface.asa_name,
+                        destination=interface.effective_ip(),
+                        mask="255.255.255.255",
+                        gateway="0.0.0.0",
+                        metric=0,
+                    )
+                )
+        return routes
+
+    def _build_command_trees(self) -> Tuple[CommandNode, CommandNode, CommandNode, CommandNode]:
         user_root = CommandNode("root")
         enabled_root = CommandNode("root")
         config_root = CommandNode("root")
+        interface_root = CommandNode("root")
 
         self._add_command(user_root, ["enable"], "Turn on privileged commands", self._cmd_enable)
         self._add_command(user_root, ["exit"], "Exit from the EXEC", self._cmd_exit)
@@ -309,8 +414,22 @@ class AsaCli:
         self._add_command(config_root, ["end"], "Exit from configure mode", self._cmd_end)
         self._add_command(config_root, ["exit"], "Exit from configure mode", self._cmd_exit)
         self._add_command(config_root, ["write", "memory"], "Write the running configuration to memory", self._cmd_write_memory)
+        self._set_help(config_root, ["hostname"], "Set system's network name")
+        self._set_help(config_root, ["interface"], "Select an interface to configure")
+        self._set_help(config_root, ["route"], "Add a static route")
+        self._set_help(config_root, ["no"], "Negate a command or set its defaults")
 
-        for root in (user_root, enabled_root, config_root):
+        self._add_command(interface_root, ["end"], "Exit from configure mode", self._cmd_end)
+        self._add_command(interface_root, ["exit"], "Exit from interface configuration", self._cmd_exit)
+        self._set_help(interface_root, ["description"], "Set interface description")
+        self._set_help(interface_root, ["nameif"], "Set interface logical name")
+        self._set_help(interface_root, ["security-level"], "Set interface security level")
+        self._set_help(interface_root, ["ip"], "Interface Internet Protocol config commands")
+        self._set_help(interface_root, ["ip", "address"], "Set the IP address and subnet mask")
+        self._set_help(interface_root, ["shutdown"], "Shutdown the selected interface")
+        self._set_help(interface_root, ["no"], "Negate a command or set its defaults")
+
+        for root in (user_root, enabled_root, config_root, interface_root):
             self._add_command(root, ["show", "cpu"], "Display processor utilization", self._show_cpu)
             self._add_command(root, ["show", "memory"], "Display memory utilization", self._show_memory)
             self._add_command(root, ["show", "mem"], "Display memory utilization", self._show_memory)
@@ -322,6 +441,7 @@ class AsaCli:
             self._add_command(root, ["show", "system"], "Display host system information", self._show_system)
             self._add_command(root, ["show", "interface", "ip", "brief"], "Interface IP status and configuration", self._show_interface_ip_brief)
             self._add_command(root, ["show", "ip", "interface", "brief"], "Interface IP status and configuration", self._show_interface_ip_brief)
+            self._add_command(root, ["show", "route"], "Display the route table", self._show_route)
             self._set_help(root, ["show"], "Show running system information")
             self._set_help(root, ["show", "interface"], "Interface information")
             self._set_help(root, ["show", "ip"], "IP information")
@@ -333,7 +453,7 @@ class AsaCli:
         self._set_help(enabled_root, ["terminal"], "Set terminal line parameters")
         self._set_help(config_root, ["write"], "Write running configuration to memory, network, or terminal")
 
-        return user_root, enabled_root, config_root
+        return user_root, enabled_root, config_root, interface_root
 
     @staticmethod
     def _add_command(root: CommandNode, words: List[str], help_text: str, action: Callable[[], Optional[bool]]) -> None:
@@ -356,7 +476,9 @@ class AsaCli:
             node.help_text = help_text
 
     def _current_tree(self) -> CommandNode:
-        if self.config_mode:
+        if self.config_submode == "config-if":
+            return self.interface_tree
+        if self.config_submode == "config":
             return self.config_tree
         if self.enabled:
             return self.enabled_tree
@@ -423,6 +545,10 @@ class AsaCli:
             suggestions = sorted(node.children)
             return buffer, suggestions
 
+        dynamic = self._dynamic_completion(buffer, words, trailing_space)
+        if dynamic is not None:
+            return dynamic
+
         path_words = words[:-1] if not trailing_space else words
         current = words[-1] if words and not trailing_space else ""
 
@@ -456,6 +582,10 @@ class AsaCli:
         if "?" in line:
             self._handle_question_mark(line)
             return False
+
+        handled, should_exit = self._handle_mode_specific_command(line)
+        if handled:
+            return should_exit
 
         status, node, error_index = self._resolve_command(line)
         if status == "ok" and node and node.action:
@@ -505,6 +635,9 @@ class AsaCli:
         words, trailing_space = split_words(prefix)
         node = self._current_tree()
 
+        if self._print_dynamic_help(words, trailing_space):
+            return
+
         if not words:
             self._print_help_entries(node.children)
             return
@@ -552,14 +685,20 @@ class AsaCli:
 
     def _cmd_disable(self) -> None:
         self.enabled = False
-        self.config_mode = False
+        self.config_submode = "exec"
+        self.current_interface = None
 
     def _cmd_end(self) -> None:
-        self.config_mode = False
+        self.config_submode = "exec"
+        self.current_interface = None
 
     def _cmd_exit(self) -> bool:
-        if self.config_mode:
-            self.config_mode = False
+        if self.config_submode == "config-if":
+            self.config_submode = "config"
+            self.current_interface = None
+            return False
+        if self.config_submode == "config":
+            self.config_submode = "exec"
             return False
         print("Logoff")
         return True
@@ -568,7 +707,7 @@ class AsaCli:
         if not self.enabled:
             print("% Privileged mode required.")
             return
-        self.config_mode = True
+        self.config_submode = "config"
 
     def _cmd_write_memory(self) -> None:
         print("Building configuration...")
@@ -576,6 +715,442 @@ class AsaCli:
 
     def _cmd_terminal_length(self) -> None:
         print("% Incomplete command.")
+
+    def _apply_interface_admin_state(self, interface: EmulatedInterface, enabled: bool) -> bool:
+        action = "enabled" if enabled else "disabled"
+        if not self._ensure_admin():
+            return False
+        ok, output = run_live_command(
+            [
+                "netsh",
+                "interface",
+                "set",
+                "interface",
+                f"name={interface.windows_name}",
+                f"admin={action}",
+            ]
+        )
+        if not ok:
+            self._print_windows_error(output)
+        return ok
+
+    def _apply_static_ip(self, interface: EmulatedInterface, ip_address: str, mask: str) -> bool:
+        if not self._ensure_admin():
+            return False
+        ok, output = run_live_command(
+            [
+                "netsh",
+                "interface",
+                "ipv4",
+                "set",
+                "address",
+                f"name={interface.windows_name}",
+                "static",
+                ip_address,
+                mask,
+                "none",
+            ]
+        )
+        if not ok:
+            self._print_windows_error(output)
+        return ok
+
+    def _apply_dhcp_ip(self, interface: EmulatedInterface) -> bool:
+        if not self._ensure_admin():
+            return False
+        ok, output = run_live_command(
+            [
+                "netsh",
+                "interface",
+                "ipv4",
+                "set",
+                "address",
+                f"name={interface.windows_name}",
+                "dhcp",
+            ]
+        )
+        if not ok:
+            self._print_windows_error(output)
+        return ok
+
+    def _apply_route(self, interface: EmulatedInterface, route: StaticRoute, negate: bool) -> bool:
+        prefix_length = mask_to_prefix(route.mask)
+        if prefix_length is None:
+            print("% Invalid route netmask.")
+            return False
+        if not self._ensure_admin():
+            return False
+
+        action = "delete" if negate else "add"
+        command = [
+            "netsh",
+            "interface",
+            "ipv4",
+            action,
+            "route",
+            f"prefix={route.destination}/{prefix_length}",
+            f"interface={interface.windows_name}",
+            f"nexthop={route.gateway}",
+            "store=active",
+        ]
+        if not negate:
+            command.insert(-1, f"metric={route.metric}")
+
+        ok, output = run_live_command(command)
+        if not ok:
+            self._print_windows_error(output)
+        return ok
+
+    @staticmethod
+    def _ensure_admin() -> bool:
+        if is_admin():
+            return True
+        print("% Windows administrator privileges are required to apply this command.")
+        print("% Restart PowerShell as Administrator and run the emulator again.")
+        return False
+
+    @staticmethod
+    def _print_windows_error(output: str) -> None:
+        print("% Windows rejected the live network change.")
+        if output:
+            print(output)
+
+    def _dynamic_completion(self, buffer: str, words: List[str], trailing_space: bool) -> Optional[Tuple[str, List[str]]]:
+        if self.config_submode == "config":
+            if words and self._matches(words[0], "interface"):
+                return self._complete_value_command(buffer, words, trailing_space, list(self.interfaces))
+            if words and self._matches(words[0], "route"):
+                return self._complete_value_command(buffer, words, trailing_space, list(self.interfaces))
+            if words and self._matches(words[0], "no") and len(words) > 1 and self._matches(words[1], "route"):
+                return self._complete_value_command(buffer, words, trailing_space, list(self.interfaces), offset=1)
+        if self.config_submode == "config-if":
+            if words and self._matches(words[0], "ip"):
+                if len(words) == 3 and not trailing_space and self._matches(words[1], "address"):
+                    return self._complete_last_word(words, ["dhcp"], append_space=True)
+                if len(words) == 4 and not trailing_space and self._matches(words[1], "address") and self._matches(words[2], "dhcp"):
+                    return self._complete_last_word(words, ["setroute"], append_space=True)
+                if len(words) <= 2:
+                    options = ["address"]
+                elif len(words) == 3 and self._matches(words[1], "address"):
+                    options = ["dhcp"]
+                elif len(words) == 4 and self._matches(words[1], "address") and self._matches(words[2], "dhcp"):
+                    options = ["setroute"]
+                else:
+                    options = []
+                return self._complete_value_command(buffer, words, trailing_space, options)
+            if words and self._matches(words[0], "no"):
+                options = ["description", "ip", "nameif", "security-level", "shutdown"]
+                return self._complete_value_command(buffer, words, trailing_space, options)
+        return None
+
+    @staticmethod
+    def _complete_last_word(words: List[str], options: List[str], append_space: bool) -> Tuple[str, List[str]]:
+        current = words[-1].lower()
+        matches = sorted(option for option in options if option.startswith(current))
+        if len(matches) == 1:
+            completed = " ".join(words[:-1] + [matches[0]])
+            return (completed + " " if append_space else completed), matches
+        return " ".join(words), matches
+
+    def _complete_value_command(
+        self,
+        buffer: str,
+        words: List[str],
+        trailing_space: bool,
+        options: List[str],
+        offset: int = 0,
+    ) -> Optional[Tuple[str, List[str]]]:
+        base_index = 1 + offset
+        if len(words) < base_index or not options:
+            return None
+
+        if len(words) == base_index and trailing_space:
+            return buffer, sorted(options)
+        if len(words) == base_index + 1 and not trailing_space:
+            current = words[-1].lower()
+            matches = sorted(option for option in options if option.lower().startswith(current))
+            if not matches:
+                return buffer, []
+            if len(matches) == 1:
+                completed = " ".join(words[:-1] + [matches[0]])
+                return completed + " ", matches
+            return buffer, matches
+        return None
+
+    def _print_dynamic_help(self, words: List[str], trailing_space: bool) -> bool:
+        if self.config_submode == "config" and words:
+            if self._matches(words[0], "interface"):
+                self._print_interface_name_help()
+                return True
+            if self._matches(words[0], "route"):
+                self._print_route_interface_help()
+                return True
+            if self._matches(words[0], "no") and len(words) > 1 and self._matches(words[1], "route"):
+                self._print_route_interface_help()
+                return True
+
+        if self.config_submode == "config-if" and words:
+            first = words[0]
+            if self._matches(first, "ip"):
+                if len(words) == 1 or (len(words) == 2 and not trailing_space):
+                    print("  address  Set the IP address and subnet mask")
+                    return True
+                if len(words) >= 2 and self._matches(words[1], "address"):
+                    print("  A.B.C.D  Interface IP address")
+                    print("  dhcp     Use DHCP to obtain interface IP address")
+                    return True
+            if self._matches(first, "no"):
+                print("  description     Reset interface description")
+                print("  ip              Remove interface IP settings")
+                print("  nameif          Remove logical interface name")
+                print("  security-level  Remove interface security level")
+                print("  shutdown        Bring the interface up")
+                return True
+        return False
+
+    def _print_interface_name_help(self) -> None:
+        width = max((len(interface.asa_name) for interface in self.interfaces.values()), default=0) + 2
+        for interface in self.interfaces.values():
+            print(f"  {interface.asa_name.ljust(width)}{interface.windows_name}")
+
+    def _print_route_interface_help(self) -> None:
+        width = max((len(interface.asa_name) for interface in self.interfaces.values()), default=0) + 2
+        for interface in self.interfaces.values():
+            label = interface.nameif or interface.windows_name
+            print(f"  {interface.asa_name.ljust(width)}Route out via {label}")
+
+    @staticmethod
+    def _matches(value: str, keyword: str) -> bool:
+        return keyword.startswith(value.lower())
+
+    def _handle_mode_specific_command(self, line: str) -> Tuple[bool, bool]:
+        if self.config_submode == "config":
+            return self._handle_global_config_command(line)
+        if self.config_submode == "config-if":
+            return self._handle_interface_config_command(line)
+        if self.enabled and line.lower().startswith("terminal length "):
+            print(f"Terminal length set to {line.split()[-1]}")
+            return True, False
+        return False, False
+
+    def _handle_global_config_command(self, line: str) -> Tuple[bool, bool]:
+        words = line.split()
+        lowered = [word.lower() for word in words]
+        if not words:
+            return True, False
+
+        if self._matches(lowered[0], "hostname"):
+            if len(words) < 2:
+                print("% Incomplete command.")
+            else:
+                self.hostname = self._sanitize_hostname(words[1])
+            return True, False
+
+        if self._matches(lowered[0], "interface"):
+            if len(words) < 2:
+                print("% Incomplete command.")
+                return True, False
+            resolved = self._resolve_interface_name(words[1])
+            if resolved is None:
+                self._print_invalid_marker(line, line.lower().find(words[1].lower()))
+                return True, False
+            self.current_interface = resolved
+            self.config_submode = "config-if"
+            return True, False
+
+        if self._matches(lowered[0], "route"):
+            self._configure_route(words, negate=False)
+            return True, False
+
+        if self._matches(lowered[0], "no") and len(words) > 1 and self._matches(lowered[1], "route"):
+            self._configure_route(words[1:], negate=True)
+            return True, False
+
+        return False, False
+
+    def _handle_interface_config_command(self, line: str) -> Tuple[bool, bool]:
+        if not self.current_interface:
+            return False, False
+
+        interface = self.interfaces[self.current_interface]
+        words = line.split()
+        lowered = [word.lower() for word in words]
+        if not words:
+            return True, False
+
+        if self._matches(lowered[0], "description"):
+            if len(words) < 2:
+                print("% Incomplete command.")
+            else:
+                interface.description = line.split(None, 1)[1]
+            return True, False
+
+        if self._matches(lowered[0], "nameif"):
+            if len(words) < 2:
+                print("% Incomplete command.")
+            else:
+                interface.nameif = words[1]
+            return True, False
+
+        if self._matches(lowered[0], "security-level"):
+            if len(words) < 2:
+                print("% Incomplete command.")
+            else:
+                try:
+                    value = int(words[1])
+                    if 0 <= value <= 100:
+                        interface.security_level = value
+                    else:
+                        print("% Security level must be between 0 and 100.")
+                except ValueError:
+                    print("% Invalid security level.")
+            return True, False
+
+        if self._matches(lowered[0], "ip"):
+            if len(words) >= 2 and self._matches(lowered[1], "address"):
+                if len(words) < 4:
+                    if len(words) == 3 and self._matches(words[2].lower(), "dhcp"):
+                        if self._apply_dhcp_ip(interface):
+                            interface.dhcp_enabled = True
+                            interface.dhcp_setroute = False
+                            interface.configured_ip = None
+                            interface.configured_mask = None
+                    else:
+                        print("% Incomplete command.")
+                elif self._matches(words[2].lower(), "dhcp"):
+                    setroute = len(words) > 3 and self._matches(words[3].lower(), "setroute")
+                    if self._apply_dhcp_ip(interface):
+                        interface.dhcp_enabled = True
+                        interface.dhcp_setroute = setroute
+                        interface.configured_ip = None
+                        interface.configured_mask = None
+                elif self._valid_ipv4(words[2]) and mask_to_prefix(words[3]) is not None:
+                    if self._apply_static_ip(interface, words[2], words[3]):
+                        interface.configured_ip = words[2]
+                        interface.configured_mask = words[3]
+                        interface.dhcp_enabled = False
+                        interface.dhcp_setroute = False
+                else:
+                    print("% Invalid IP address or subnet mask.")
+                return True, False
+
+        if self._matches(lowered[0], "shutdown"):
+            if self._apply_interface_admin_state(interface, enabled=False):
+                interface.shutdown = True
+            return True, False
+
+        if self._matches(lowered[0], "no"):
+            if len(words) < 2:
+                print("% Incomplete command.")
+                return True, False
+            target = lowered[1]
+            if self._matches(target, "shutdown"):
+                if self._apply_interface_admin_state(interface, enabled=True):
+                    interface.shutdown = False
+            elif self._matches(target, "description"):
+                interface.description = f"Windows adapter: {interface.windows_name}"
+            elif self._matches(target, "nameif"):
+                interface.nameif = None
+            elif self._matches(target, "security-level"):
+                interface.security_level = None
+            elif self._matches(target, "ip"):
+                if self._apply_dhcp_ip(interface):
+                    interface.configured_ip = None
+                    interface.configured_mask = None
+                    interface.dhcp_enabled = True
+                    interface.dhcp_setroute = False
+            else:
+                self._print_invalid_marker(line, line.lower().find(words[1].lower()))
+            return True, False
+
+        return False, False
+
+    def _resolve_interface_name(self, name: str) -> Optional[str]:
+        lowered = name.lower()
+        aliases = {key: key for key in self.interfaces}
+        aliases.update(
+            {
+                interface.nameif.lower(): key
+                for key, interface in self.interfaces.items()
+                if interface.nameif
+            }
+        )
+        matches = [alias for alias in aliases if alias.startswith(lowered)]
+        if not matches:
+            return None
+        if len(matches) > 1 and lowered not in aliases:
+            return None
+        return aliases[lowered] if lowered in aliases else aliases[matches[0]]
+
+    @staticmethod
+    def _display_interface_name(interface: EmulatedInterface) -> str:
+        return interface.nameif or interface.asa_name
+
+    def _configure_route(self, words: List[str], negate: bool) -> None:
+        if len(words) < 5:
+            print("% Incomplete command.")
+            return
+
+        interface_key = self._resolve_interface_name(words[1])
+        if interface_key is None:
+            print("% Invalid interface.")
+            return
+
+        destination, mask, gateway = words[2], words[3], words[4]
+        metric = 1
+        if len(words) > 5:
+            try:
+                metric = int(words[5])
+            except ValueError:
+                print("% Invalid route metric.")
+                return
+
+        if not all(self._valid_ipv4(value) for value in (destination, mask, gateway)):
+            print("% Invalid route parameters.")
+            return
+
+        interface = self.interfaces[interface_key]
+        interface_name = self._display_interface_name(interface)
+        existing = [
+            route for route in self.static_routes
+            if route.interface_name == interface_name
+            and route.destination == destination
+            and route.mask == mask
+            and route.gateway == gateway
+        ]
+        route = StaticRoute(
+            interface_name=interface_name,
+            destination=destination,
+            mask=mask,
+            gateway=gateway,
+            metric=metric,
+        )
+
+        if negate:
+            if existing:
+                if self._apply_route(interface, existing[0], negate=True):
+                    self.static_routes = [route for route in self.static_routes if route not in existing]
+            else:
+                print("% Route not found.")
+            return
+
+        if existing:
+            if existing[0].metric == metric:
+                return
+            if self._apply_route(interface, existing[0], negate=True) and self._apply_route(interface, route, negate=False):
+                existing[0].metric = metric
+            return
+
+        if self._apply_route(interface, route, negate=False):
+            self.static_routes.append(route)
+
+    @staticmethod
+    def _valid_ipv4(value: str) -> bool:
+        try:
+            ipaddress.IPv4Address(value)
+            return True
+        except ipaddress.AddressValueError:
+            return False
 
     def _show_hostname(self) -> None:
         print(self.hostname)
@@ -630,16 +1205,18 @@ class AsaCli:
             print("No interfaces discovered")
             return
 
-        for interface in self.interfaces:
-            ipv4 = interface.ipv4_addresses[0] if interface.ipv4_addresses else "unassigned"
-            method = "DHCP" if (interface.dhcp_enabled or "").lower() == "yes" else "manual"
+        for interface in self.interfaces.values():
+            ipv4 = interface.effective_ip() or "unassigned"
+            method = interface.effective_method()
+            status = "administratively down" if interface.shutdown else "up"
+            protocol = "down" if interface.shutdown else "up"
             print(
-                f"{interface.name[:22]:22} "
+                f"{interface.asa_name[:22]:22} "
                 f"{ipv4[:15]:15} "
                 f"YES "
                 f"{method:6} "
-                f"{interface.status:21} "
-                f"up"
+                f"{status:21} "
+                f"{protocol}"
             )
 
     def _show_system(self) -> None:
@@ -652,6 +1229,20 @@ class AsaCli:
         print(f"Total Memory GB : {get_total_memory_gb()}")
         print(f"User            : {self.username}")
         print(f"Working Dir     : {os.getcwd()}")
+
+    def _show_route(self) -> None:
+        print("Codes: C - connected, S - static")
+        for interface in self.interfaces.values():
+            ip_address = interface.effective_ip()
+            if ip_address and not interface.shutdown:
+                print(f"C    {ip_address} 255.255.255.255 is directly connected, {self._display_interface_name(interface)}")
+        for route in self.static_routes:
+            if route.metric == 0:
+                continue
+            print(
+                f"S    {route.destination} {route.mask} "
+                f"[{route.metric}/0] via {route.gateway}, {route.interface_name}"
+            )
 
     def _show_running_config(self) -> None:
         print(": Saved")
@@ -675,21 +1266,33 @@ class AsaCli:
         print(f"! Physical memory (GB): {get_total_memory_gb()}")
         print("!")
 
-        for index, interface in enumerate(self.interfaces, start=1):
-            if_name = self._asa_interface_name(index, interface.name)
-            print(f"interface {if_name}")
-            print(f" description Windows adapter: {interface.name}")
+        for interface in self.interfaces.values():
+            print(f"interface {interface.asa_name}")
+            print(f" description {interface.description}")
             print(f" mac-address {interface.mac_address}")
-            if interface.ipv4_addresses:
-                print(f" ip address {interface.ipv4_addresses[0]} 255.255.255.255")
+            if interface.nameif:
+                print(f" nameif {interface.nameif}")
+            if interface.security_level is not None:
+                print(f" security-level {interface.security_level}")
+            if interface.dhcp_enabled:
+                suffix = " setroute" if interface.dhcp_setroute else ""
+                print(f" ip address dhcp{suffix}")
+            elif interface.configured_ip and interface.configured_mask:
+                print(f" ip address {interface.configured_ip} {interface.configured_mask}")
+            elif interface.live_ipv4:
+                print(f" ip address {interface.live_ipv4} 255.255.255.255")
             else:
                 print(" no ip address")
-            if interface.status == "administratively down":
+            if interface.shutdown:
                 print(" shutdown")
             else:
                 print(" no shutdown")
             print("!")
 
+        for route in self.static_routes:
+            if route.metric == 0:
+                continue
+            print(f"route {route.interface_name} {route.destination} {route.mask} {route.gateway} {route.metric}")
         print("service-policy global_policy global")
 
     def _show_tech(self) -> None:
@@ -713,6 +1316,9 @@ class AsaCli:
         print()
         print("---------- show interface ip brief ----------")
         self._show_interface_ip_brief()
+        print()
+        print("---------- show route ----------")
+        self._show_route()
         print()
         print("---------- show running-config ----------")
         self._show_running_config()
