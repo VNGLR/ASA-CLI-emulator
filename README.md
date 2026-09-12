@@ -36,8 +36,15 @@ Static routes are installed in the Windows persistent route store. A static IP c
 ```text
 show version
 show interface ip brief
+show interface GigabitEthernet1/0
+show cpu detail
+show cpu detail 5
+show memory detail
+show mem detail 5
 show route
 show running-config
+show run interface
+show run route
 show startup-config
 show tech-support
 show tech sanitized

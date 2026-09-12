@@ -450,6 +450,40 @@ def _looks_like_ipv4(value: str) -> bool:
         return False
 
 
+def powershell_json_array(command: str) -> List[Dict[str, object]]:
+    output = clean_command_output(powershell(command))
+    if not output:
+        return []
+    try:
+        values = json.loads(output)
+    except json.JSONDecodeError:
+        return []
+    if isinstance(values, dict):
+        values = [values]
+    return [value for value in values if isinstance(value, dict)] if isinstance(values, list) else []
+
+
+def get_top_cpu_processes(limit: int = 10) -> List[Dict[str, object]]:
+    return powershell_json_array(
+        "$interval = 0.5; $before = @{}; "
+        "Get-Process -ErrorAction SilentlyContinue | Where-Object { $null -ne $_.CPU } | "
+        "ForEach-Object { $before[$_.Id] = $_.CPU }; "
+        "Start-Sleep -Milliseconds 500; "
+        "Get-Process -ErrorAction SilentlyContinue | Where-Object { $before.ContainsKey($_.Id) -and $null -ne $_.CPU } | "
+        "ForEach-Object { [PSCustomObject]@{ProcessName=$_.ProcessName; Id=$_.Id; CpuPercent=[math]::Round((($_.CPU - $before[$_.Id]) / $interval / [Environment]::ProcessorCount) * 100, 1); WorkingSetMB=[math]::Round($_.WorkingSet64 / 1MB, 1)} } | "
+        f"Sort-Object CpuPercent -Descending | Select-Object -First {limit} | ConvertTo-Json -Compress"
+    )
+
+
+def get_top_memory_processes(limit: int = 10) -> List[Dict[str, object]]:
+    return powershell_json_array(
+        "Get-Process -ErrorAction SilentlyContinue | "
+        "Sort-Object WorkingSet64 -Descending | "
+        f"Select-Object -First {limit} ProcessName,Id,@{{Name='WorkingSetMB';Expression={{[math]::Round($_.WorkingSet64 / 1MB, 1)}}}},@{{Name='PagedMemoryMB';Expression={{[math]::Round($_.PagedMemorySize64 / 1MB, 1)}}}},Handles | "
+        "ConvertTo-Json -Compress"
+    )
+
+
 class AsaCli:
     def __init__(self) -> None:
         self.hostname = self._sanitize_hostname(get_hostname())
@@ -626,19 +660,25 @@ class AsaCli:
 
         for root in (user_root, enabled_root, config_root, interface_root):
             self._add_command(root, ["show", "cpu"], "Display processor utilization", self._show_cpu)
+            self._add_command(root, ["show", "cpu", "detail"], "Display detailed processor utilization", self._show_cpu_detail)
             self._add_command(root, ["show", "memory"], "Display memory utilization", self._show_memory)
             self._add_command(root, ["show", "mem"], "Display memory utilization", self._show_memory)
+            self._add_command(root, ["show", "memory", "detail"], "Display detailed memory utilization", self._show_memory_detail)
+            self._add_command(root, ["show", "mem", "detail"], "Display detailed memory utilization", self._show_memory_detail)
             self._add_command(root, ["show", "tech"], "Display technical support information", self._show_tech)
             self._add_command(root, ["show", "tech-support"], "Display technical support information", self._show_tech)
             self._add_command(root, ["show", "tech", "sanitized"], "Display sanitized technical support information", self._show_tech_sanitized)
             self._add_command(root, ["show", "tech-support", "sanitized"], "Display sanitized technical support information", self._show_tech_sanitized)
             self._add_command(root, ["show", "version"], "System software information", self._show_version)
             self._add_command(root, ["show", "running-config"], "Current operating configuration", self._show_running_config)
+            self._add_command(root, ["show", "running-config", "interface"], "Interface configuration", self._show_running_interfaces)
+            self._add_command(root, ["show", "running-config", "route"], "Static route configuration", self._show_running_routes)
             self._add_command(root, ["show", "startup-config"], "Contents of the startup configuration", self._show_startup_config)
             self._add_command(root, ["show", "inventory"], "Hardware and platform inventory", self._show_inventory)
             self._add_command(root, ["show", "hostname"], "Display the device hostname", self._show_hostname)
             self._add_command(root, ["show", "system"], "Display host system information", self._show_system)
             self._add_command(root, ["show", "interface", "ip", "brief"], "Interface IP status and configuration", self._show_interface_ip_brief)
+            self._add_command(root, ["show", "interface"], "Display interface details", self._show_interfaces_detail)
             self._add_command(root, ["show", "ip", "interface", "brief"], "Interface IP status and configuration", self._show_interface_ip_brief)
             self._add_command(root, ["show", "route"], "Display the route table", self._show_route)
             self._set_help(root, ["show"], "Show running system information")
@@ -838,6 +878,9 @@ class AsaCli:
             self._handle_question_mark(line)
             return False
 
+        if self._handle_show_variants(line):
+            return False
+
         handled, should_exit = self._handle_mode_specific_command(line)
         if handled:
             return should_exit
@@ -851,6 +894,81 @@ class AsaCli:
             return False
         self._print_invalid_marker(line, error_index)
         return False
+
+    def _handle_show_variants(self, line: str) -> bool:
+        words = line.split()
+        if len(words) < 2 or not self._matches(words[0], "show"):
+            return False
+
+        show_node = self._current_tree().children.get("show")
+        if show_node is None:
+            return False
+        status, subject = self._resolve_token(words[1], show_node.children)
+        if status != "ok" or subject is None:
+            return False
+
+        if subject == "interface":
+            if len(words) == 2:
+                self._show_interfaces_detail()
+                return True
+            if len(words) == 3 and not self._matches(words[2], "ip"):
+                interface_key = self._resolve_interface_name(words[2])
+                if interface_key is None:
+                    self._print_invalid_marker(line, line.lower().find(words[2].lower()))
+                else:
+                    self._show_interface_detail(self.interfaces[interface_key])
+                return True
+            return False
+
+        if subject == "running-config":
+            if len(words) == 4 and self._matches(words[2], "interface"):
+                interface_key = self._resolve_interface_name(words[3])
+                if interface_key is None:
+                    self._print_invalid_marker(line, line.lower().find(words[3].lower()))
+                else:
+                    self._show_running_interface_block(self.interfaces[interface_key])
+                return True
+            return False
+
+        if subject == "cpu":
+            if len(words) == 2:
+                self._show_cpu()
+            elif len(words) == 3 and self._matches(words[2], "detail"):
+                self._show_cpu_detail()
+            elif len(words) == 4 and self._matches(words[2], "detail"):
+                limit = self._parse_process_limit(words[3])
+                if limit is not None:
+                    self._show_cpu_detail(limit)
+            else:
+                self._print_invalid_marker(line, line.lower().find(words[2].lower()))
+            return True
+
+        if subject in {"memory", "mem"}:
+            if len(words) == 2:
+                self._show_memory()
+            elif len(words) == 3 and self._matches(words[2], "detail"):
+                self._show_memory_detail()
+            elif len(words) == 4 and self._matches(words[2], "detail"):
+                limit = self._parse_process_limit(words[3])
+                if limit is not None:
+                    self._show_memory_detail(limit)
+            else:
+                self._print_invalid_marker(line, line.lower().find(words[2].lower()))
+            return True
+
+        return False
+
+    @staticmethod
+    def _parse_process_limit(value: str) -> Optional[int]:
+        try:
+            limit = int(value)
+        except ValueError:
+            print("% Process count must be a whole number between 1 and 100.")
+            return None
+        if not 1 <= limit <= 100:
+            print("% Process count must be between 1 and 100.")
+            return None
+        return limit
 
     def _resolve_command(self, line: str) -> Tuple[str, Optional[CommandNode], int]:
         words = line.split()
@@ -1114,6 +1232,10 @@ class AsaCli:
             print(output)
 
     def _dynamic_completion(self, buffer: str, words: List[str], trailing_space: bool) -> Optional[Tuple[str, List[str]]]:
+        show_completion = self._complete_show_variant(buffer, words, trailing_space)
+        if show_completion is not None:
+            return show_completion
+
         if self.config_submode == "config":
             if words and self._matches(words[0], "interface"):
                 return self._complete_value_command(buffer, words, trailing_space, list(self.interfaces))
@@ -1140,6 +1262,36 @@ class AsaCli:
                 options = ["description", "ip", "nameif", "security-level", "shutdown"]
                 return self._complete_value_command(buffer, words, trailing_space, options)
         return None
+
+    def _complete_show_variant(self, buffer: str, words: List[str], trailing_space: bool) -> Optional[Tuple[str, List[str]]]:
+        if len(words) < 2 or not self._matches(words[0], "show"):
+            return None
+        show_node = self._current_tree().children.get("show")
+        if show_node is None:
+            return None
+        status, subject = self._resolve_token(words[1], show_node.children)
+        if status != "ok" or subject is None:
+            return None
+
+        if subject == "interface":
+            options = ["ip", *self._interface_completion_names()]
+            if len(words) == 2 and trailing_space:
+                return buffer, sorted(options)
+            if len(words) == 3 and not trailing_space:
+                return self._complete_last_word(words, options, append_space=True)
+            return None
+
+        if subject in {"cpu", "memory", "mem"}:
+            if len(words) == 2 and trailing_space:
+                return buffer, ["detail"]
+            if len(words) == 3 and not trailing_space:
+                return self._complete_last_word(words, ["detail"], append_space=True)
+        return None
+
+    def _interface_completion_names(self) -> List[str]:
+        names = [interface.asa_name.lower() for interface in self.interfaces.values()]
+        names.extend(interface.nameif.lower() for interface in self.interfaces.values() if interface.nameif)
+        return sorted(set(names))
 
     @staticmethod
     def _complete_last_word(words: List[str], options: List[str], append_space: bool) -> Tuple[str, List[str]]:
@@ -1182,6 +1334,36 @@ class AsaCli:
         return None
 
     def _print_dynamic_help(self, words: List[str], trailing_space: bool) -> bool:
+        if len(words) >= 2 and self._matches(words[0], "show"):
+            show_node = self._current_tree().children.get("show")
+            if show_node is not None:
+                status, subject = self._resolve_token(words[1], show_node.children)
+                if status == "ok" and subject == "interface":
+                    if len(words) == 2 and trailing_space:
+                        print("  ip                    Interface IP information")
+                        self._print_interface_name_help()
+                        return True
+                    if len(words) == 3 and not trailing_space:
+                        matches = [name for name in self._interface_completion_names() if name.startswith(words[2].lower())]
+                        if matches:
+                            for name in matches:
+                                print(f"  {name}")
+                            return True
+                if status == "ok" and subject == "running-config":
+                    if len(words) == 2 and trailing_space:
+                        print("  interface  Interface configuration")
+                        print("  route      Static route configuration")
+                        return True
+                    if len(words) == 3 and self._matches(words[2], "interface") and trailing_space:
+                        self._print_interface_name_help()
+                        return True
+                if status == "ok" and subject in {"cpu", "memory", "mem"} and len(words) == 2 and trailing_space:
+                    print("  detail  Include top Windows process utilization")
+                    return True
+                if status == "ok" and subject in {"cpu", "memory", "mem"} and len(words) == 3 and self._matches(words[2], "detail") and trailing_space:
+                    print("  <1-100>  Number of top processes to display")
+                    return True
+
         if self.config_submode == "config" and words:
             if self._matches(words[0], "interface"):
                 self._print_interface_name_help()
@@ -1533,6 +1715,22 @@ class AsaCli:
         print(f"Logical processors      = {processors or 'Unknown'}")
         print(f"Processor               = {platform.processor() or 'Unknown'}")
 
+    def _show_cpu_detail(self, limit: int = 10) -> None:
+        self._show_cpu()
+        processes = get_top_cpu_processes(limit)
+        print()
+        print(f"Top {limit} processes by sampled CPU utilization:")
+        print("Process                          PID      CPU%  Working Set")
+        if not processes:
+            print("Process CPU detail unavailable")
+            return
+        for process in processes:
+            name = str(process.get("ProcessName", "Unknown"))
+            process_id = process.get("Id", "-")
+            cpu_percent = float(process.get("CpuPercent", 0.0))
+            working_set = float(process.get("WorkingSetMB", 0.0))
+            print(f"{name[:30]:30} {str(process_id):>7} {cpu_percent:8.1f}% {working_set:10.1f} MB")
+
     def _show_memory(self) -> None:
         snapshot = get_memory_snapshot()
         if not snapshot:
@@ -1545,6 +1743,26 @@ class AsaCli:
         print(f"Memory load             : {snapshot['load_percent']:.0f}%")
         print(f"Total virtual memory    : {snapshot['total_virtual_gb']:.2f} GB")
         print(f"Free virtual memory     : {snapshot['available_virtual_gb']:.2f} GB")
+
+    def _show_memory_detail(self, limit: int = 10) -> None:
+        self._show_memory()
+        processes = get_top_memory_processes(limit)
+        print()
+        print(f"Top {limit} processes by working-set memory:")
+        print("Process                          PID  Working Set  Paged Memory  Handles")
+        if not processes:
+            print("Process memory detail unavailable")
+            return
+        for process in processes:
+            name = str(process.get("ProcessName", "Unknown"))
+            process_id = process.get("Id", "-")
+            working_set = float(process.get("WorkingSetMB", 0.0))
+            paged_memory = float(process.get("PagedMemoryMB", 0.0))
+            handles = process.get("Handles", "-")
+            print(
+                f"{name[:30]:30} {str(process_id):>7} {working_set:10.1f} MB "
+                f"{paged_memory:10.1f} MB {str(handles):>8}"
+            )
 
     def _show_interface_ip_brief(self) -> None:
         print("Interface              IP-Address      OK? Method Status                Protocol")
@@ -1642,34 +1860,45 @@ class AsaCli:
         print(f"! Physical memory (GB): {get_total_memory_gb()}")
         print("!")
 
-        for interface in self.interfaces.values():
-            print(f"interface {interface.asa_name}")
-            print(f" description {interface.description}")
-            print(f" mac-address {interface.mac_address}")
-            if interface.nameif:
-                print(f" nameif {interface.nameif}")
-            if interface.security_level is not None:
-                print(f" security-level {interface.security_level}")
-            if interface.dhcp_enabled:
-                suffix = " setroute" if interface.dhcp_setroute else ""
-                print(f" ip address dhcp{suffix}")
-            elif interface.configured_ip and interface.configured_mask:
-                print(f" ip address {interface.configured_ip} {interface.configured_mask}")
-            elif interface.live_ipv4:
-                print(f" ip address {interface.live_ipv4} 255.255.255.255")
-            else:
-                print(" no ip address")
-            if interface.shutdown:
-                print(" shutdown")
-            else:
-                print(" no shutdown")
-            print("!")
-
-        for route in self.static_routes:
-            if route.metric == 0:
-                continue
-            print(f"route {route.interface_name} {route.destination} {route.mask} {route.gateway} {route.metric}")
+        self._show_running_interfaces()
+        self._show_running_routes()
         print("service-policy global_policy global")
+
+    def _show_running_interface_block(self, interface: EmulatedInterface) -> None:
+        print(f"interface {interface.asa_name}")
+        print(f" description {interface.description}")
+        print(f" mac-address {interface.mac_address}")
+        if interface.nameif:
+            print(f" nameif {interface.nameif}")
+        if interface.security_level is not None:
+            print(f" security-level {interface.security_level}")
+        if interface.dhcp_enabled:
+            suffix = " setroute" if interface.dhcp_setroute else ""
+            print(f" ip address dhcp{suffix}")
+        elif interface.configured_ip and interface.configured_mask:
+            print(f" ip address {interface.configured_ip} {interface.configured_mask}")
+        elif interface.live_ipv4:
+            print(f" ip address {interface.live_ipv4} 255.255.255.255")
+        else:
+            print(" no ip address")
+        if interface.shutdown:
+            print(" shutdown")
+        else:
+            print(" no shutdown")
+        print("!")
+
+    def _show_running_interfaces(self) -> None:
+        for interface in self.interfaces.values():
+            self._show_running_interface_block(interface)
+
+    def _show_running_routes(self) -> None:
+        routes = [route for route in self.static_routes if route.metric != 0]
+        if not routes:
+            print("! No static routes configured")
+            return
+        for route in routes:
+            print(f"route {route.interface_name} {route.destination} {route.mask} {route.gateway} {route.metric}")
+
 
     def _running_config_text(self) -> str:
         output = io.StringIO()
@@ -1703,20 +1932,24 @@ class AsaCli:
             return
 
         for interface in self.interfaces.values():
-            status = "administratively down" if interface.shutdown else "up"
-            protocol = "down" if interface.shutdown else "up"
-            ip_address = interface.effective_ip() or "unassigned"
-            mask = interface.configured_mask or ("DHCP" if interface.dhcp_enabled else "255.255.255.255")
-            print(f"Interface {interface.asa_name} \"{self._display_interface_name(interface)}\", is {status}, line protocol is {protocol}")
-            print(f"  Hardware is Windows adapter, BW 1000000 Kbit, DLY 10 usec")
-            print(f"  Description: {interface.description}")
-            print(f"  MAC address {interface.mac_address}, MTU 1500")
-            print(f"  IP address {ip_address}, subnet mask {mask}")
-            print(f"  Method {interface.effective_method()}, security level {interface.security_level if interface.security_level is not None else 'unset'}")
-            print("  Input queue: 0/2000/0/0 (size/max/drops/flushes); Total output drops: 0")
-            print("  5 minute input rate 0 bits/sec, 0 packets/sec")
-            print("  5 minute output rate 0 bits/sec, 0 packets/sec")
-            print()
+            self._show_interface_detail(interface)
+
+    def _show_interface_detail(self, interface: EmulatedInterface) -> None:
+        status = "administratively down" if interface.shutdown else "up"
+        protocol = "down" if interface.shutdown else "up"
+        ip_address = interface.effective_ip() or "unassigned"
+        mask = interface.configured_mask or ("DHCP" if interface.dhcp_enabled else "255.255.255.255")
+        print(f"Interface {interface.asa_name} \"{self._display_interface_name(interface)}\", is {status}, line protocol is {protocol}")
+        print(f"  Windows adapter: {interface.windows_name}")
+        print("  Hardware is Windows adapter, BW 1000000 Kbit, DLY 10 usec")
+        print(f"  Description: {interface.description}")
+        print(f"  MAC address {interface.mac_address}, MTU 1500")
+        print(f"  IP address {ip_address}, subnet mask {mask}")
+        print(f"  Method {interface.effective_method()}, security level {interface.security_level if interface.security_level is not None else 'unset'}")
+        print("  Input queue: 0/2000/0/0 (size/max/drops/flushes); Total output drops: 0")
+        print("  5 minute input rate 0 bits/sec, 0 packets/sec")
+        print("  5 minute output rate 0 bits/sec, 0 packets/sec")
+        print()
 
     def _show_ip_address(self) -> None:
         print("System IP Addresses:")

@@ -95,6 +95,53 @@ class AsaCliTests(unittest.TestCase):
         self.assertNotIn("10.0.0.10", output)
         self.assertNotIn("00-11-22-33-44-55", output)
 
+    def test_show_interface_renders_selected_adapter_only(self):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.cli._dispatch_line("show interface gigabitethernet1/0")
+        rendered = output.getvalue()
+        self.assertIn('Interface GigabitEthernet1/0 "GigabitEthernet1/0"', rendered)
+        self.assertIn("Windows adapter: Ethernet", rendered)
+        self.assertNotIn("GigabitEthernet2/0", rendered)
+
+    def test_show_cpu_detail_displays_top_processes(self):
+        processes = [{"ProcessName": "cpu-heavy", "Id": 100, "CpuPercent": 42.5, "WorkingSetMB": 128.0}]
+        with patch("asa_cli_emulator.get_top_cpu_processes", return_value=processes):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.cli._dispatch_line("show cpu detail 1")
+        self.assertIn("Top 1 processes by sampled CPU utilization", output.getvalue())
+        self.assertIn("cpu-heavy", output.getvalue())
+
+    def test_show_memory_detail_displays_top_processes(self):
+        processes = [{"ProcessName": "memory-heavy", "Id": 200, "WorkingSetMB": 512.0, "PagedMemoryMB": 256.0, "Handles": 12}]
+        with patch("asa_cli_emulator.get_top_memory_processes", return_value=processes):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.cli._dispatch_line("show mem detail 1")
+        self.assertIn("Top 1 processes by working-set memory", output.getvalue())
+        self.assertIn("memory-heavy", output.getvalue())
+
+    def test_show_run_interface_only_displays_interface_configuration(self):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.cli._dispatch_line("show run int")
+        rendered = output.getvalue()
+        self.assertIn("interface GigabitEthernet1/0", rendered)
+        self.assertNotIn("ASA Version", rendered)
+        self.assertNotIn("service-policy", rendered)
+
+    def test_show_run_route_only_displays_route_configuration(self):
+        self.cli.static_routes.append(
+            StaticRoute("GigabitEthernet1/0", "198.51.100.0", "255.255.255.0", "10.0.0.1", 1)
+        )
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.cli._dispatch_line("show run route")
+        rendered = output.getvalue()
+        self.assertIn("route GigabitEthernet1/0 198.51.100.0", rendered)
+        self.assertNotIn("interface GigabitEthernet", rendered)
+
 
 if __name__ == "__main__":
     unittest.main()
