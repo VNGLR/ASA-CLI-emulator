@@ -47,6 +47,9 @@ show processes cpu-usage non-zero sorted
 show processes memory
 show conn
 show conn count
+show conn protocol tcp state up
+show conn address 192.0.2.10-192.0.2.20 port 443 detail
+show conn all
 show dns
 show dns trusted-source detail
 show route

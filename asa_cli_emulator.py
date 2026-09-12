@@ -547,6 +547,17 @@ class WindowsDnsServer:
     address: str
 
 
+@dataclass
+class ConnectionFilters:
+    show_all: bool = False
+    detail: bool = False
+    long_format: bool = False
+    protocols: List[str] = field(default_factory=list)
+    states: List[str] = field(default_factory=list)
+    address_filters: List[Tuple[str, Optional[str]]] = field(default_factory=list)
+    port_filters: List[str] = field(default_factory=list)
+
+
 def get_windows_connections() -> List[WindowsConnection]:
     values = powershell_json_array(
         "$tcp = Get-NetTCPConnection -ErrorAction SilentlyContinue | "
@@ -802,6 +813,13 @@ class AsaCli:
             self._set_help(root, ["show", "processes", "internals"], "Display Windows process details")
             self._add_command(root, ["show", "conn"], "Display active TCP and UDP connections", self._show_connections)
             self._add_command(root, ["show", "conn", "count"], "Display active connection counts", self._show_conn_count)
+            self._set_help(root, ["show", "conn", "all"], "Display all discovered connections")
+            self._set_help(root, ["show", "conn", "detail"], "Include Windows connection details")
+            self._set_help(root, ["show", "conn", "long"], "Display expanded endpoint information")
+            self._set_help(root, ["show", "conn", "state"], "Filter by connection state")
+            self._set_help(root, ["show", "conn", "protocol"], "Filter by TCP or UDP")
+            self._set_help(root, ["show", "conn", "address"], "Filter by an endpoint address or address range")
+            self._set_help(root, ["show", "conn", "port"], "Filter by an endpoint port or port range")
             self._add_command(root, ["show", "dns"], "Display Windows DNS resolver configuration", self._show_dns)
             self._set_help(root, ["show", "dns", "trusted-source"], "Display configured DNS servers")
             self._set_help(root, ["show", "dns", "trusted-source", "detail"], "Include Windows adapter names")
@@ -1135,12 +1153,7 @@ class AsaCli:
             return True
 
         if subject == "conn":
-            if len(words) == 2:
-                self._show_connections()
-            elif len(words) == 3 and self._matches(words[2], "count"):
-                self._show_conn_count()
-            else:
-                self._print_invalid_marker(line, line.lower().find(words[2].lower()))
+            self._handle_show_conn_variant(line, words)
             return True
 
         if subject == "dns":
@@ -1185,6 +1198,103 @@ class AsaCli:
             self._show_processes_internals()
             return
         self._print_invalid_marker(line, line.lower().find(words[2].lower()))
+
+    def _handle_show_conn_variant(self, line: str, words: List[str]) -> None:
+        if len(words) == 2:
+            self._show_connections()
+            return
+        if len(words) == 3 and self._matches(words[2], "count"):
+            self._show_conn_count()
+            return
+
+        filters = ConnectionFilters()
+        index = 2
+        while index < len(words):
+            token = words[index]
+            if self._matches(token, "all"):
+                filters.show_all = True
+                index += 1
+            elif self._matches(token, "detail"):
+                filters.detail = True
+                index += 1
+            elif self._matches(token, "long"):
+                filters.long_format = True
+                index += 1
+            elif self._matches(token, "protocol"):
+                if index + 1 >= len(words):
+                    print("% Incomplete command.")
+                    return
+                protocol = words[index + 1].lower()
+                if protocol not in {"tcp", "udp"}:
+                    self._print_invalid_marker(line, line.lower().find(words[index + 1].lower()))
+                    return
+                filters.protocols.append(protocol.upper())
+                index += 2
+            elif self._matches(token, "state"):
+                if index + 1 >= len(words):
+                    print("% Incomplete command.")
+                    return
+                states = [state.strip().lower() for state in words[index + 1].split(",") if state.strip()]
+                if not states:
+                    self._print_invalid_marker(line, line.lower().find(words[index + 1].lower()))
+                    return
+                filters.states.extend(states)
+                index += 2
+            elif self._matches(token, "address"):
+                if index + 1 >= len(words) or not self._valid_connection_address(words[index + 1]):
+                    error_index = line.lower().find(words[index].lower()) if index + 1 >= len(words) else line.lower().find(words[index + 1].lower())
+                    self._print_invalid_marker(line, error_index)
+                    return
+                address = words[index + 1]
+                mask: Optional[str] = None
+                index += 2
+                if index < len(words) and self._matches(words[index], "netmask"):
+                    if index + 1 >= len(words) or not self._valid_connection_netmask(address, words[index + 1]):
+                        error_index = line.lower().find(words[index].lower()) if index + 1 >= len(words) else line.lower().find(words[index + 1].lower())
+                        self._print_invalid_marker(line, error_index)
+                        return
+                    mask = words[index + 1]
+                    index += 2
+                filters.address_filters.append((address, mask))
+            elif self._matches(token, "port"):
+                if index + 1 >= len(words) or not self._valid_connection_port(words[index + 1]):
+                    error_index = line.lower().find(words[index].lower()) if index + 1 >= len(words) else line.lower().find(words[index + 1].lower())
+                    self._print_invalid_marker(line, error_index)
+                    return
+                filters.port_filters.append(words[index + 1])
+                index += 2
+            else:
+                self._print_invalid_marker(line, line.lower().find(token.lower()))
+                return
+        self._show_connections(filters)
+
+    @staticmethod
+    def _valid_connection_address(value: str) -> bool:
+        values = value.split("-", 1)
+        try:
+            addresses = [ipaddress.ip_address(item) for item in values]
+        except ValueError:
+            return False
+        return len(addresses) in {1, 2} and (len(addresses) == 1 or addresses[0].version == addresses[1].version)
+
+    @staticmethod
+    def _valid_connection_netmask(address: str, mask: str) -> bool:
+        if "-" in address:
+            return False
+        try:
+            ipaddress.IPv4Network(f"{address}/{mask}", strict=False)
+            return True
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _valid_connection_port(value: str) -> bool:
+        try:
+            values = value.split("-", 1)
+            start, end = int(values[0]), int(values[-1])
+        except ValueError:
+            return False
+        return 0 <= start <= end <= 65535
 
     def _handle_diagnostic_command(self, line: str) -> bool:
         """Run bounded Windows diagnostics through ASA-style EXEC commands."""
@@ -1595,6 +1705,15 @@ class AsaCli:
                 return self._complete_last_word(words, self._interface_completion_names(), append_space=False)
             return None
 
+        if subject == "conn":
+            if len(words) == 3 and trailing_space and self._matches(words[2], "protocol"):
+                return buffer, ["tcp", "udp"]
+            if len(words) == 3 and trailing_space and self._matches(words[2], "state"):
+                return buffer, ["up", "tcp-embryonic", "established", "time-wait"]
+            if len(words) == 4 and trailing_space and self._matches(words[2], "address"):
+                return buffer, ["netmask", "port"]
+            return None
+
         if subject == "processes":
             process_options = ["cpu-hog", "cpu-usage", "internals", "memory"]
             if len(words) == 2 and trailing_space:
@@ -1711,6 +1830,22 @@ class AsaCli:
                         return True
                     if len(words) == 3 and self._matches(words[2], "interface") and trailing_space:
                         self._print_interface_name_help()
+                        return True
+                if status == "ok" and subject == "conn":
+                    if len(words) == 3 and self._matches(words[2], "protocol") and trailing_space:
+                        print("  tcp  Display TCP connections")
+                        print("  udp  Display UDP connections")
+                        return True
+                    if len(words) == 3 and self._matches(words[2], "state") and trailing_space:
+                        print("  up             Display established TCP and active UDP connections")
+                        print("  tcp-embryonic  Display TCP connections awaiting handshake completion")
+                        print("  <state,...>    Filter by one or more comma-separated Windows connection states")
+                        return True
+                    if len(words) == 3 and self._matches(words[2], "address") and trailing_space:
+                        print("  <ip[-ip]>  Match either endpoint by an IP address or address range")
+                        return True
+                    if len(words) == 3 and self._matches(words[2], "port") and trailing_space:
+                        print("  <port[-port]>  Match either endpoint by a port or port range")
                         return True
                 if status == "ok" and subject == "processes":
                     if len(words) == 2 and trailing_space:
@@ -2454,21 +2589,89 @@ class AsaCli:
             handles = int(process.get("Handles", 0) or 0)
             print(f"{name[:30]:30} {process_id:>7} {working_set:10.1f} MB {paged_memory:10.1f} MB {handles:>8}")
 
-    def _show_connections(self) -> None:
-        connections = get_windows_connections()
+    @staticmethod
+    def _format_connection_endpoint(address: str, port: int) -> str:
+        return f"[{address}]:{port}" if ":" in address else f"{address}:{port}"
+
+    @staticmethod
+    def _connection_matches_address(address: str, specification: str, mask: Optional[str]) -> bool:
+        try:
+            target = ipaddress.ip_address(address)
+            if mask:
+                return target in ipaddress.IPv4Network(f"{specification}/{mask}", strict=False)
+            if "-" in specification:
+                lower, upper = (ipaddress.ip_address(value) for value in specification.split("-", 1))
+                if target.version != lower.version:
+                    return False
+                return lower <= target <= upper
+            return target == ipaddress.ip_address(specification)
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _connection_matches_port(port: int, specification: str) -> bool:
+        values = specification.split("-", 1)
+        lower, upper = int(values[0]), int(values[-1])
+        return lower <= port <= upper
+
+    @staticmethod
+    def _connection_matches_state(connection: WindowsConnection, state: str) -> bool:
+        requested = state.lower().replace("-", "")
+        actual = connection.state.lower().replace("-", "")
+        if requested == "up":
+            return actual in {"established", "active"}
+        if requested == "tcpembryonic":
+            return actual in {"synsent", "synreceived"}
+        return actual == requested
+
+    def _connection_matches_filters(self, connection: WindowsConnection, filters: ConnectionFilters) -> bool:
+        if filters.protocols and connection.protocol not in filters.protocols:
+            return False
+        if filters.states and not any(self._connection_matches_state(connection, state) for state in filters.states):
+            return False
+        endpoints = [(connection.local_address, connection.local_port), (connection.remote_address, connection.remote_port)]
+        if any(not any(self._connection_matches_address(address, specification, mask) for address, _ in endpoints) for specification, mask in filters.address_filters):
+            return False
+        if any(not any(self._connection_matches_port(port, specification) for _, port in endpoints) for specification in filters.port_filters):
+            return False
+        return True
+
+    @staticmethod
+    def _connection_flags(connection: WindowsConnection) -> str:
+        if connection.protocol == "UDP":
+            return "U"
+        if connection.state.lower() == "established":
+            return "UIO"
+        if connection.state.lower() in {"synsent", "synreceived"}:
+            return "i"
+        return "-"
+
+    def _show_connections(self, filters: Optional[ConnectionFilters] = None) -> None:
+        filters = filters or ConnectionFilters()
+        connections = [
+            connection for connection in get_windows_connections()
+            if self._connection_matches_filters(connection, filters)
+        ]
+        print(f"{len(connections)} in use, {len(connections)} most used")
         if not connections:
-            print("No active TCP or UDP connections discovered")
+            print("No Windows connections matched the requested filters")
             return
-        for connection in connections[:100]:
+
+        displayed = connections if filters.show_all else connections[:100]
+        for connection in displayed:
             interface_name = self._interface_name_for_route_ip(connection.local_address)
-            local = f"{connection.local_address}:{connection.local_port}"
-            remote = f"{connection.remote_address}:{connection.remote_port}"
+            local = self._format_connection_endpoint(connection.local_address, connection.local_port)
+            remote = self._format_connection_endpoint(connection.remote_address, connection.remote_port)
             print(
-                f"{connection.protocol:3} {interface_name:18} {local:22} {remote:22} "
-                f"{connection.state:12} pid {connection.owning_process}"
+                f"{connection.protocol} {interface_name} {local} {remote}, "
+                f"state {connection.state}, flags {self._connection_flags(connection)}, pid {connection.owning_process}"
             )
-        if len(connections) > 100:
-            print(f"... {len(connections) - 100} additional Windows connections omitted")
+            if filters.detail or filters.long_format:
+                print(f"  Local interface: {interface_name}; Windows state: {connection.state}; owning PID: {connection.owning_process}")
+            if filters.detail:
+                print(f"  Local endpoint: {local}; remote endpoint: {remote}; traffic counters: unavailable from Windows snapshot")
+        if not filters.show_all and len(connections) > len(displayed):
+            print(f"... {len(connections) - len(displayed)} additional connections omitted; use 'show conn all'")
 
     def _show_dns(self, detail: bool = False) -> None:
         servers = get_windows_dns_servers()

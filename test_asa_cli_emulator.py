@@ -106,6 +106,27 @@ class AsaCliTests(unittest.TestCase):
         self.assertIn("GigabitEthernet1/0", rendered)
         self.assertIn("Established", rendered)
 
+    def test_show_conn_combines_protocol_address_port_state_and_detail_filters(self):
+        connections = [
+            WindowsConnection("TCP", "10.0.0.10", 50000, "198.51.100.1", 443, "Established", 1234),
+            WindowsConnection("UDP", "10.0.0.10", 5353, "224.0.0.251", 5353, "ACTIVE", 4321),
+        ]
+        with patch("asa_cli_emulator.get_windows_connections", return_value=connections):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.cli._dispatch_line(
+                    "show conn protocol tcp address 198.51.100.1 port 443 state up detail"
+                )
+        rendered = output.getvalue()
+        self.assertIn("198.51.100.1:443", rendered)
+        self.assertIn("traffic counters: unavailable", rendered)
+        self.assertNotIn("224.0.0.251", rendered)
+
+    def test_show_conn_protocol_completion_suggests_supported_protocols(self):
+        completed, suggestions = self.cli._complete_line("show conn protocol ")
+        self.assertEqual("show conn protocol ", completed)
+        self.assertEqual(["tcp", "udp"], suggestions)
+
     def test_show_dns_renders_configured_windows_dns_servers(self):
         servers = [WindowsDnsServer("Ethernet", "1.1.1.1")]
         with patch("asa_cli_emulator.get_windows_dns_servers", return_value=servers):
