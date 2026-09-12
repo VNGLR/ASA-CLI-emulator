@@ -659,6 +659,10 @@ class AsaCli:
         self._set_help(interface_root, ["no"], "Negate a command or set its defaults")
 
         for root in (user_root, enabled_root, config_root, interface_root):
+            self._set_help(root, ["ping"], "Send ICMP echo requests")
+            self._set_help(root, ["traceroute"], "Trace the route to a destination")
+            self._set_help(root, ["trace"], "Trace route commands")
+            self._set_help(root, ["trace", "route"], "Trace the route to a destination")
             self._add_command(root, ["show", "cpu"], "Display processor utilization", self._show_cpu)
             self._add_command(root, ["show", "cpu", "detail"], "Display detailed processor utilization", self._show_cpu_detail)
             self._add_command(root, ["show", "memory"], "Display memory utilization", self._show_memory)
@@ -878,6 +882,9 @@ class AsaCli:
             self._handle_question_mark(line)
             return False
 
+        if self._handle_diagnostic_command(line):
+            return False
+
         if self._handle_show_variants(line):
             return False
 
@@ -957,6 +964,85 @@ class AsaCli:
             return True
 
         return False
+
+    def _handle_diagnostic_command(self, line: str) -> bool:
+        """Run bounded Windows diagnostics through ASA-style EXEC commands."""
+        words = line.split()
+        if not words:
+            return False
+
+        if self._matches(words[0], "ping"):
+            self._run_ping(words[1:])
+            return True
+
+        # Check the two-word alias before traceroute: "trace" is a valid
+        # abbreviation of "traceroute" and would otherwise capture it.
+        if words[0].lower() == "trace" and len(words) >= 2 and self._matches(words[1], "route"):
+            self._run_traceroute(words[2:])
+            return True
+
+        if words[0].lower() == "trace" and len(words) == 1:
+            print("% Incomplete command.")
+            return True
+
+        if self._matches(words[0], "traceroute"):
+            self._run_traceroute(words[1:])
+            return True
+        return False
+
+    @staticmethod
+    def _valid_diagnostic_host(host: str) -> bool:
+        """Allow IPv4 addresses and ordinary host names without accepting flags."""
+        if len(host) > 253:
+            return False
+        try:
+            ipaddress.IPv4Address(host)
+            return True
+        except ValueError:
+            return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", host))
+
+    def _parse_diagnostic_arguments(self, arguments: List[str], default_limit: int, maximum_limit: int) -> Optional[Tuple[str, int]]:
+        if not arguments:
+            print("% Incomplete command.")
+            return None
+        if len(arguments) > 2:
+            print("% Invalid input detected at '^' marker.")
+            return None
+
+        host = arguments[0]
+        if not self._valid_diagnostic_host(host):
+            print("% Invalid destination.")
+            return None
+
+        limit = default_limit
+        if len(arguments) == 2:
+            try:
+                limit = int(arguments[1])
+            except ValueError:
+                print(f"% Expected a number between 1 and {maximum_limit}.")
+                return None
+            if not 1 <= limit <= maximum_limit:
+                print(f"% Expected a number between 1 and {maximum_limit}.")
+                return None
+        return host, limit
+
+    def _run_ping(self, arguments: List[str]) -> None:
+        parsed = self._parse_diagnostic_arguments(arguments, default_limit=4, maximum_limit=20)
+        if parsed is None:
+            return
+        host, repeat = parsed
+        output = run_command(["ping", "-n", str(repeat), host])
+        if output:
+            print(output)
+
+    def _run_traceroute(self, arguments: List[str]) -> None:
+        parsed = self._parse_diagnostic_arguments(arguments, default_limit=10, maximum_limit=30)
+        if parsed is None:
+            return
+        host, hops = parsed
+        output = run_command(["tracert", "-d", "-h", str(hops), "-w", "1000", host])
+        if output:
+            print(output)
 
     @staticmethod
     def _parse_process_limit(value: str) -> Optional[int]:
@@ -1238,11 +1324,11 @@ class AsaCli:
 
         if self.config_submode == "config":
             if words and self._matches(words[0], "interface"):
-                return self._complete_value_command(buffer, words, trailing_space, list(self.interfaces))
+                return self._complete_value_command(buffer, words, trailing_space, self._interface_completion_names())
             if words and self._matches(words[0], "route"):
-                return self._complete_value_command(buffer, words, trailing_space, list(self.interfaces))
+                return self._complete_value_command(buffer, words, trailing_space, self._interface_completion_names())
             if words and self._matches(words[0], "no") and len(words) > 1 and self._matches(words[1], "route"):
-                return self._complete_value_command(buffer, words, trailing_space, list(self.interfaces), offset=1)
+                return self._complete_value_command(buffer, words, trailing_space, self._interface_completion_names(), offset=1)
         if self.config_submode == "config-if":
             if words and self._matches(words[0], "ip"):
                 if len(words) == 3 and not trailing_space and self._matches(words[1], "address"):
@@ -1281,6 +1367,13 @@ class AsaCli:
                 return self._complete_last_word(words, options, append_space=True)
             return None
 
+        if subject == "running-config":
+            if len(words) == 3 and self._matches(words[2], "interface") and trailing_space:
+                return buffer, self._interface_completion_names()
+            if len(words) == 4 and self._matches(words[2], "interface") and not trailing_space:
+                return self._complete_last_word(words, self._interface_completion_names(), append_space=False)
+            return None
+
         if subject in {"cpu", "memory", "mem"}:
             if len(words) == 2 and trailing_space:
                 return buffer, ["detail"]
@@ -1289,14 +1382,14 @@ class AsaCli:
         return None
 
     def _interface_completion_names(self) -> List[str]:
-        names = [interface.asa_name.lower() for interface in self.interfaces.values()]
-        names.extend(interface.nameif.lower() for interface in self.interfaces.values() if interface.nameif)
+        names = [interface.asa_name for interface in self.interfaces.values()]
+        names.extend(interface.nameif for interface in self.interfaces.values() if interface.nameif)
         return sorted(set(names))
 
     @staticmethod
     def _complete_last_word(words: List[str], options: List[str], append_space: bool) -> Tuple[str, List[str]]:
         current = words[-1].lower()
-        matches = sorted(option for option in options if option.startswith(current))
+        matches = sorted(option for option in options if option.lower().startswith(current))
         if len(matches) == 1:
             completed = " ".join(words[:-1] + [matches[0]])
             return (completed + " " if append_space else completed), matches
@@ -1334,6 +1427,29 @@ class AsaCli:
         return None
 
     def _print_dynamic_help(self, words: List[str], trailing_space: bool) -> bool:
+        if words and self._matches(words[0], "ping"):
+            if len(words) == 1 and trailing_space:
+                print("  <hostname-or-ip>  Destination to probe")
+                return True
+            if len(words) == 2 and trailing_space:
+                print("  <1-20>            Number of echo requests (default: 4)")
+                return True
+
+        trace_route = (
+            words
+            and words[0].lower() == "trace"
+            and len(words) >= 2
+            and self._matches(words[1], "route")
+        )
+        if (words and self._matches(words[0], "traceroute")) or trace_route:
+            argument_index = 2 if trace_route else 1
+            if len(words) == argument_index and trailing_space:
+                print("  <hostname-or-ip>  Destination to trace")
+                return True
+            if len(words) == argument_index + 1 and trailing_space:
+                print("  <1-30>            Maximum hops (default: 10)")
+                return True
+
         if len(words) >= 2 and self._matches(words[0], "show"):
             show_node = self._current_tree().children.get("show")
             if show_node is not None:
@@ -1344,7 +1460,10 @@ class AsaCli:
                         self._print_interface_name_help()
                         return True
                     if len(words) == 3 and not trailing_space:
-                        matches = [name for name in self._interface_completion_names() if name.startswith(words[2].lower())]
+                        matches = [
+                            name for name in self._interface_completion_names()
+                            if name.lower().startswith(words[2].lower())
+                        ]
                         if matches:
                             for name in matches:
                                 print(f"  {name}")

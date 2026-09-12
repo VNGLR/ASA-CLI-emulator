@@ -49,8 +49,30 @@ class AsaCliTests(unittest.TestCase):
         self.cli._cmd_enable()
         self.cli._cmd_configure_terminal()
         completed, suggestions = self.cli._complete_line("interface gig")
-        self.assertEqual("interface gigabitethernet", completed)
+        self.assertEqual("interface GigabitEthernet", completed)
         self.assertEqual(2, len(suggestions))
+
+    def test_show_run_interface_tab_completion_uses_canonical_prefix(self):
+        self.cli._cmd_enable()
+        completed, suggestions = self.cli._complete_line("show run interface gig")
+        self.assertEqual("show run interface GigabitEthernet", completed)
+        self.assertEqual(2, len(suggestions))
+
+    def test_ping_invokes_windows_ping_with_repeat_count(self):
+        with patch("asa_cli_emulator.run_command", return_value="Ping reply") as run:
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.cli._dispatch_line("ping 192.0.2.1 2")
+        run.assert_called_once_with(["ping", "-n", "2", "192.0.2.1"])
+        self.assertIn("Ping reply", output.getvalue())
+
+    def test_trace_route_invokes_windows_tracert_with_hop_limit(self):
+        with patch("asa_cli_emulator.run_command", return_value="Trace output") as run:
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.cli._dispatch_line("trace route example.com 8")
+        run.assert_called_once_with(["tracert", "-d", "-h", "8", "-w", "1000", "example.com"])
+        self.assertIn("Trace output", output.getvalue())
 
     def test_invalid_dhcp_suffix_does_not_apply(self):
         self.enter_interface_mode()

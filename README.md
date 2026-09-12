@@ -44,7 +44,12 @@ show mem detail 5
 show route
 show running-config
 show run interface
+show run interface GigabitEthernet1/0
 show run route
+ping 192.0.2.1
+ping example.com 3
+traceroute 192.0.2.1
+trace route example.com 8
 show startup-config
 show tech-support
 show tech sanitized
