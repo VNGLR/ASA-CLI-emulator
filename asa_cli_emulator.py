@@ -348,6 +348,14 @@ class WindowsRoute:
     metric: int
 
 
+@dataclass
+class WindowsArpEntry:
+    address: str
+    mac_address: str
+    state: str
+    interface_alias: str
+
+
 def get_windows_ipv4_routes() -> List[WindowsRoute]:
     output = run_command(["route", "print", "-4"])
     routes: List[WindowsRoute] = []
@@ -450,6 +458,35 @@ def _looks_like_ipv4(value: str) -> bool:
         return False
 
 
+def get_windows_arp_entries() -> List[WindowsArpEntry]:
+    values = powershell_json_array(
+        "Get-NetNeighbor -AddressFamily IPv4 -ErrorAction SilentlyContinue | "
+        "Select-Object IPAddress,LinkLayerAddress,State,InterfaceAlias | ConvertTo-Json -Compress"
+    )
+    entries: List[WindowsArpEntry] = []
+    for value in values:
+        address = value.get("IPAddress")
+        mac_address = value.get("LinkLayerAddress")
+        state = value.get("State")
+        interface_alias = value.get("InterfaceAlias")
+        if not isinstance(address, str) or not _looks_like_ipv4(address):
+            continue
+        if not isinstance(mac_address, str) or not isinstance(interface_alias, str):
+            continue
+        compact_mac = re.sub(r"[^0-9A-Fa-f]", "", mac_address)
+        if len(compact_mac) != 12 or compact_mac == "000000000000":
+            continue
+        entries.append(
+            WindowsArpEntry(
+                address=address,
+                mac_address=compact_mac.upper(),
+                state=str(state or "Unknown"),
+                interface_alias=interface_alias,
+            )
+        )
+    return sorted(entries, key=lambda entry: (ipaddress.IPv4Address(entry.address), entry.interface_alias.lower()))
+
+
 def powershell_json_array(command: str) -> List[Dict[str, object]]:
     output = clean_command_output(powershell(command))
     if not output:
@@ -482,6 +519,89 @@ def get_top_memory_processes(limit: int = 10) -> List[Dict[str, object]]:
         f"Select-Object -First {limit} ProcessName,Id,@{{Name='WorkingSetMB';Expression={{[math]::Round($_.WorkingSet64 / 1MB, 1)}}}},@{{Name='PagedMemoryMB';Expression={{[math]::Round($_.PagedMemorySize64 / 1MB, 1)}}}},Handles | "
         "ConvertTo-Json -Compress"
     )
+
+
+def get_windows_processes(limit: int = 100) -> List[Dict[str, object]]:
+    return powershell_json_array(
+        "Get-Process -ErrorAction SilentlyContinue | "
+        "Sort-Object Id | "
+        f"Select-Object -First {limit} ProcessName,Id,CPU,@{{Name='WorkingSetMB';Expression={{[math]::Round($_.WorkingSet64 / 1MB, 1)}}}},Handles | "
+        "ConvertTo-Json -Compress"
+    )
+
+
+@dataclass
+class WindowsConnection:
+    protocol: str
+    local_address: str
+    local_port: int
+    remote_address: str
+    remote_port: int
+    state: str
+    owning_process: int
+
+
+@dataclass(frozen=True)
+class WindowsDnsServer:
+    interface_alias: str
+    address: str
+
+
+def get_windows_connections() -> List[WindowsConnection]:
+    values = powershell_json_array(
+        "$tcp = Get-NetTCPConnection -ErrorAction SilentlyContinue | "
+        "Where-Object { $_.State -ne 'Listen' } | "
+        "ForEach-Object { [PSCustomObject]@{Protocol='TCP';LocalAddress=$_.LocalAddress;LocalPort=$_.LocalPort;RemoteAddress=$_.RemoteAddress;RemotePort=$_.RemotePort;State=$_.State;OwningProcess=$_.OwningProcess} }; "
+        "$udp = Get-NetUDPEndpoint -ErrorAction SilentlyContinue | "
+        "ForEach-Object { [PSCustomObject]@{Protocol='UDP';LocalAddress=$_.LocalAddress;LocalPort=$_.LocalPort;RemoteAddress='0.0.0.0';RemotePort=0;State='ACTIVE';OwningProcess=$_.OwningProcess} }; "
+        "@($tcp) + @($udp) | ConvertTo-Json -Compress"
+    )
+    connections: List[WindowsConnection] = []
+    for value in values:
+        try:
+            protocol = str(value["Protocol"])
+            local_address = str(value["LocalAddress"])
+            local_port = int(value["LocalPort"])
+            remote_address = str(value["RemoteAddress"])
+            remote_port = int(value["RemotePort"])
+            state = str(value["State"])
+            owning_process = int(value["OwningProcess"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        connections.append(
+            WindowsConnection(
+                protocol=protocol,
+                local_address=local_address,
+                local_port=local_port,
+                remote_address=remote_address,
+                remote_port=remote_port,
+                state=state,
+                owning_process=owning_process,
+            )
+        )
+    return sorted(connections, key=lambda item: (item.protocol, item.local_address, item.local_port, item.remote_address))
+
+
+def get_windows_dns_servers() -> List[WindowsDnsServer]:
+    values = powershell_json_array(
+        "Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | "
+        "Where-Object { $_.ServerAddresses } | "
+        "Select-Object InterfaceAlias,ServerAddresses | ConvertTo-Json -Compress"
+    )
+    servers: List[WindowsDnsServer] = []
+    for value in values:
+        interface_alias = value.get("InterfaceAlias")
+        addresses = value.get("ServerAddresses")
+        if not isinstance(interface_alias, str):
+            continue
+        if isinstance(addresses, str):
+            addresses = [addresses]
+        if not isinstance(addresses, list):
+            continue
+        for address in addresses:
+            if isinstance(address, str) and _looks_like_ipv4(address):
+                servers.append(WindowsDnsServer(interface_alias=interface_alias, address=address))
+    return sorted(set(servers), key=lambda item: (item.interface_alias.lower(), ipaddress.IPv4Address(item.address)))
 
 
 class AsaCli:
@@ -674,6 +794,17 @@ class AsaCli:
             self._add_command(root, ["show", "tech", "sanitized"], "Display sanitized technical support information", self._show_tech_sanitized)
             self._add_command(root, ["show", "tech-support", "sanitized"], "Display sanitized technical support information", self._show_tech_sanitized)
             self._add_command(root, ["show", "version"], "System software information", self._show_version)
+            self._add_command(root, ["show", "arp"], "Display the ARP table", self._show_arp)
+            self._add_command(root, ["show", "processes"], "Display running processes", self._show_processes)
+            self._set_help(root, ["show", "processes", "cpu-usage"], "Display sampled CPU utilization by process")
+            self._set_help(root, ["show", "processes", "cpu-hog"], "Display processes using the most sampled CPU")
+            self._set_help(root, ["show", "processes", "memory"], "Display process memory allocation")
+            self._set_help(root, ["show", "processes", "internals"], "Display Windows process details")
+            self._add_command(root, ["show", "conn"], "Display active TCP and UDP connections", self._show_connections)
+            self._add_command(root, ["show", "conn", "count"], "Display active connection counts", self._show_conn_count)
+            self._add_command(root, ["show", "dns"], "Display Windows DNS resolver configuration", self._show_dns)
+            self._set_help(root, ["show", "dns", "trusted-source"], "Display configured DNS servers")
+            self._set_help(root, ["show", "dns", "trusted-source", "detail"], "Include Windows adapter names")
             self._add_command(root, ["show", "running-config"], "Current operating configuration", self._show_running_config)
             self._add_command(root, ["show", "running-config", "interface"], "Interface configuration", self._show_running_interfaces)
             self._add_command(root, ["show", "running-config", "route"], "Static route configuration", self._show_running_routes)
@@ -874,6 +1005,10 @@ class AsaCli:
         if not line:
             return False
 
+        redirected = self._handle_show_redirection(line)
+        if redirected is not None:
+            return redirected
+
         if line.strip() == "?":
             self._print_help_for_prefix("")
             return False
@@ -901,6 +1036,38 @@ class AsaCli:
             return False
         self._print_invalid_marker(line, error_index)
         return False
+
+    def _handle_show_redirection(self, line: str) -> Optional[bool]:
+        """Save read-only show output without exposing arbitrary shell redirection."""
+        if ">" not in line:
+            return None
+
+        command, separator, target = line.partition(">")
+        command = command.strip()
+        target = target.strip()
+        words = command.split()
+        if not command or not separator or not target or ">" in target:
+            print("% Invalid output redirection.")
+            return False
+        if not words or words[0].lower() != "show":
+            print("% Output redirection is supported only for show commands.")
+            return False
+
+        destination = Path(target)
+        if destination.is_absolute() or len(destination.parts) != 1 or destination.name in {"", ".", ".."}:
+            print("% Output file must be a filename in the current directory.")
+            return False
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            should_exit = self._dispatch_line(command)
+        try:
+            destination.write_text(output.getvalue(), encoding="utf-8")
+        except OSError as exc:
+            print(f"% Unable to write {destination.name}: {exc}")
+            return False
+        print(f"Output written to {destination.name}")
+        return should_exit
 
     def _handle_show_variants(self, line: str) -> bool:
         words = line.split()
@@ -963,7 +1130,61 @@ class AsaCli:
                 self._print_invalid_marker(line, line.lower().find(words[2].lower()))
             return True
 
+        if subject == "processes":
+            self._handle_show_processes_variant(line, words)
+            return True
+
+        if subject == "conn":
+            if len(words) == 2:
+                self._show_connections()
+            elif len(words) == 3 and self._matches(words[2], "count"):
+                self._show_conn_count()
+            else:
+                self._print_invalid_marker(line, line.lower().find(words[2].lower()))
+            return True
+
+        if subject == "dns":
+            if len(words) == 2:
+                self._show_dns(detail=False)
+            elif len(words) == 3 and self._matches(words[2], "trusted-source"):
+                self._show_dns(detail=False)
+            elif len(words) == 4 and self._matches(words[2], "trusted-source") and self._matches(words[3], "detail"):
+                self._show_dns(detail=True)
+            else:
+                self._print_invalid_marker(line, line.lower().find(words[-1].lower()))
+            return True
+
         return False
+
+    def _handle_show_processes_variant(self, line: str, words: List[str]) -> None:
+        if len(words) == 2:
+            self._show_processes()
+            return
+
+        if self._matches(words[2], "cpu-usage"):
+            non_zero = False
+            sorted_output = False
+            for option in words[3:]:
+                if self._matches(option, "non-zero") and not non_zero:
+                    non_zero = True
+                elif self._matches(option, "sorted") and not sorted_output:
+                    sorted_output = True
+                else:
+                    self._print_invalid_marker(line, line.lower().find(option.lower()))
+                    return
+            self._show_processes_cpu_usage(non_zero=non_zero, sorted_output=sorted_output)
+            return
+
+        if len(words) == 3 and self._matches(words[2], "memory"):
+            self._show_processes_memory()
+            return
+        if len(words) == 3 and self._matches(words[2], "cpu-hog"):
+            self._show_processes_cpu_hog()
+            return
+        if len(words) == 3 and self._matches(words[2], "internals"):
+            self._show_processes_internals()
+            return
+        self._print_invalid_marker(line, line.lower().find(words[2].lower()))
 
     def _handle_diagnostic_command(self, line: str) -> bool:
         """Run bounded Windows diagnostics through ASA-style EXEC commands."""
@@ -1374,6 +1595,21 @@ class AsaCli:
                 return self._complete_last_word(words, self._interface_completion_names(), append_space=False)
             return None
 
+        if subject == "processes":
+            process_options = ["cpu-hog", "cpu-usage", "internals", "memory"]
+            if len(words) == 2 and trailing_space:
+                return buffer, process_options
+            if len(words) == 3 and not trailing_space:
+                return self._complete_last_word(words, process_options, append_space=True)
+            if len(words) == 3 and trailing_space and self._matches(words[2], "cpu-usage"):
+                return buffer, ["non-zero", "sorted"]
+            if len(words) == 4 and not trailing_space and self._matches(words[2], "cpu-usage"):
+                return self._complete_last_word(words, ["non-zero", "sorted"], append_space=True)
+            if len(words) == 4 and trailing_space and self._matches(words[2], "cpu-usage"):
+                remaining = [option for option in ["non-zero", "sorted"] if option not in words[3].lower()]
+                return (buffer, remaining) if remaining else None
+            return None
+
         if subject in {"cpu", "memory", "mem"}:
             if len(words) == 2 and trailing_space:
                 return buffer, ["detail"]
@@ -1475,6 +1711,17 @@ class AsaCli:
                         return True
                     if len(words) == 3 and self._matches(words[2], "interface") and trailing_space:
                         self._print_interface_name_help()
+                        return True
+                if status == "ok" and subject == "processes":
+                    if len(words) == 2 and trailing_space:
+                        print("  cpu-usage  Display sampled CPU utilization by process")
+                        print("  cpu-hog    Display processes using the most sampled CPU")
+                        print("  internals  Display Windows process details")
+                        print("  memory     Display process memory allocation")
+                        return True
+                    if len(words) == 3 and self._matches(words[2], "cpu-usage") and trailing_space:
+                        print("  non-zero  Include only processes with sampled CPU utilization")
+                        print("  sorted    Sort processes by sampled CPU utilization")
                         return True
                 if status == "ok" and subject in {"cpu", "memory", "mem"} and len(words) == 2 and trailing_space:
                     print("  detail  Include top Windows process utilization")
@@ -1708,6 +1955,12 @@ class AsaCli:
             if interface.effective_ip() == interface_ip:
                 return self._display_interface_name(interface)
         return interface_ip
+
+    def _interface_name_for_windows_name(self, windows_name: str) -> str:
+        for interface in self.interfaces.values():
+            if interface.windows_name.lower() == windows_name.lower():
+                return self._display_interface_name(interface)
+        return windows_name or "Unknown"
 
     @staticmethod
     def _is_interesting_connected_route(route: WindowsRoute) -> bool:
@@ -2088,16 +2341,25 @@ class AsaCli:
         print(f"total           {connected + static:<11}0           0           {(connected + static) * 128}")
 
     def _show_arp(self) -> None:
-        output = run_command(["arp", "-a"])
-        if output:
-            print(output)
-        else:
-            print("No ARP entries available")
+        print("Protocol  Address          Age (min)  Hardware Addr   Type  Interface")
+        entries = get_windows_arp_entries()
+        if not entries:
+            print("No ARP entries discovered")
+            return
+
+        for entry in entries:
+            mac_address = f"{entry.mac_address[:4]}.{entry.mac_address[4:8]}.{entry.mac_address[8:]}"
+            interface_name = self._interface_name_for_windows_name(entry.interface_alias)
+            entry_type = "ARPA" if entry.state.lower() != "permanent" else "ARPA static"
+            print(f"Internet  {entry.address:15}  -          {mac_address:14}  {entry_type:11} {interface_name}")
 
     def _show_conn_count(self) -> None:
-        print("0 in use, 0 most used")
-        print("TCP conn count: 0")
-        print("UDP conn count: 0")
+        connections = get_windows_connections()
+        tcp_count = sum(1 for connection in connections if connection.protocol == "TCP")
+        udp_count = sum(1 for connection in connections if connection.protocol == "UDP")
+        print(f"{len(connections)} in use, {len(connections)} most used")
+        print(f"TCP conn count: {tcp_count}")
+        print(f"UDP conn count: {udp_count}")
 
     def _show_xlate_count(self) -> None:
         print("0 in use, 0 most used")
@@ -2119,30 +2381,107 @@ class AsaCli:
         print("    Class-map: inspection_default")
         print("      Inspect: dns, packet 0, drop 0, reset-drop 0")
 
-    def _show_processes_cpu(self) -> None:
+    def _show_processes(self) -> None:
+        processes = get_windows_processes()
+        print("PC         Thread     STATE       Runtime    SBASE     Stack Process")
+        if not processes:
+            print("Windows process information unavailable")
+            return
+        for process in processes:
+            name = str(process.get("ProcessName", "Unknown"))
+            process_id = int(process.get("Id", 0) or 0)
+            runtime_ms = int(float(process.get("CPU", 0) or 0) * 1000)
+            working_set = float(process.get("WorkingSetMB", 0) or 0)
+            print(f"N/A        {process_id:>7}  Running  {runtime_ms:>12}  N/A  {working_set:>6.1f}MB {name[:40]}")
+
+    def _show_processes_cpu_usage(self, non_zero: bool = False, sorted_output: bool = False) -> None:
+        processes = get_top_cpu_processes(50)
+        if non_zero:
+            processes = [process for process in processes if float(process.get("CpuPercent", 0) or 0) > 0]
+        if not sorted_output:
+            processes = sorted(processes, key=lambda process: str(process.get("ProcessName", "")).lower())
+
         print("PC         Thread       5Sec     1Min     5Min   Process")
-        snapshot = get_cpu_snapshot()
-        usage = snapshot.get("usage_percent", 0.0)
-        print(f"0x00000000 0x00000001  {usage:5.1f}%   N/A      N/A    Windows kernel")
-        print("0x00000000 0x00000002    0.0%   N/A      N/A    ASA CLI emulator")
+        if not processes:
+            print("No Windows processes matched the CPU utilization filter")
+            return
+        for process in processes:
+            name = str(process.get("ProcessName", "Unknown"))
+            process_id = int(process.get("Id", 0) or 0)
+            cpu_percent = float(process.get("CpuPercent", 0) or 0)
+            print(f"N/A        {process_id:>8}  {cpu_percent:5.1f}%   N/A      N/A    {name[:40]}")
+
+    def _show_processes_cpu_hog(self) -> None:
+        processes = [
+            process for process in get_top_cpu_processes(20)
+            if float(process.get("CpuPercent", 0) or 0) > 0
+        ]
+        print("CPU hog statistics (Windows sampled CPU equivalent):")
+        print("Process                          PID      CPU%")
+        if not processes:
+            print("No processes reported sampled CPU utilization")
+            return
+        for process in processes:
+            print(
+                f"{str(process.get('ProcessName', 'Unknown'))[:30]:30} "
+                f"{int(process.get('Id', 0) or 0):>7} {float(process.get('CpuPercent', 0) or 0):8.1f}%"
+            )
+
+    def _show_processes_internals(self) -> None:
+        processes = get_windows_processes()
+        print("Process                          PID  Handles  Working Set")
+        if not processes:
+            print("Windows process information unavailable")
+            return
+        for process in processes:
+            name = str(process.get("ProcessName", "Unknown"))
+            process_id = int(process.get("Id", 0) or 0)
+            handles = int(process.get("Handles", 0) or 0)
+            working_set = float(process.get("WorkingSetMB", 0) or 0)
+            print(f"{name[:30]:30} {process_id:>7} {handles:>8} {working_set:10.1f} MB")
 
     def _show_processes_memory(self) -> None:
-        output = run_command(["tasklist", "/FO", "TABLE"])
-        if not output or "access denied" in output.lower():
-            output = powershell(
-                "Get-Process | Sort-Object WorkingSet64 -Descending | "
-                "Select-Object -First 20 ProcessName,Id,@{Name='WorkingSetMB';Expression={[math]::Round($_.WorkingSet64 / 1MB, 1)}} | "
-                "Format-Table -AutoSize | Out-String"
-            )
-        output = clean_command_output(output) or output
-        if not output or "access denied" in output.lower():
+        processes = get_top_memory_processes(50)
+        print("Process                          PID  Working Set  Paged Memory  Handles")
+        if not processes:
             print("Process memory information unavailable")
             return
-        lines = output.splitlines()
-        for line in lines[:22]:
-            print(line)
-        if len(lines) > 22:
-            print(f"... {len(lines) - 22} additional Windows processes omitted")
+        for process in processes:
+            name = str(process.get("ProcessName", "Unknown"))
+            process_id = int(process.get("Id", 0) or 0)
+            working_set = float(process.get("WorkingSetMB", 0) or 0)
+            paged_memory = float(process.get("PagedMemoryMB", 0) or 0)
+            handles = int(process.get("Handles", 0) or 0)
+            print(f"{name[:30]:30} {process_id:>7} {working_set:10.1f} MB {paged_memory:10.1f} MB {handles:>8}")
+
+    def _show_connections(self) -> None:
+        connections = get_windows_connections()
+        if not connections:
+            print("No active TCP or UDP connections discovered")
+            return
+        for connection in connections[:100]:
+            interface_name = self._interface_name_for_route_ip(connection.local_address)
+            local = f"{connection.local_address}:{connection.local_port}"
+            remote = f"{connection.remote_address}:{connection.remote_port}"
+            print(
+                f"{connection.protocol:3} {interface_name:18} {local:22} {remote:22} "
+                f"{connection.state:12} pid {connection.owning_process}"
+            )
+        if len(connections) > 100:
+            print(f"... {len(connections) - 100} additional Windows connections omitted")
+
+    def _show_dns(self, detail: bool = False) -> None:
+        servers = get_windows_dns_servers()
+        print("Trusted DNS source configuration:")
+        if not servers:
+            print("  No IPv4 DNS servers are configured")
+            return
+        for server in servers:
+            interface_name = self._interface_name_for_windows_name(server.interface_alias)
+            if detail:
+                print(f"  {server.address:15} interface {interface_name} ({server.interface_alias})")
+            else:
+                print(f"  {server.address:15} interface {interface_name}")
 
     def _show_blocks(self) -> None:
         print("SIZE    MAX    LOW    CNT")
@@ -2240,7 +2579,7 @@ class AsaCli:
             ("show nat detail", self._show_nat_detail),
             ("show service-policy", self._show_service_policy),
             ("show cpu detail", self._show_cpu),
-            ("show processes cpu-usage non-zero sorted", self._show_processes_cpu),
+            ("show processes cpu-usage non-zero sorted", lambda: self._show_processes_cpu_usage(non_zero=True, sorted_output=True)),
             ("show memory detail", self._show_memory),
             ("show blocks", self._show_blocks),
             ("show logging", self._show_logging_tail),

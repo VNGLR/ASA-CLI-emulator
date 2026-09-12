@@ -41,6 +41,14 @@ show cpu detail
 show cpu detail 5
 show memory detail
 show mem detail 5
+show arp
+show processes
+show processes cpu-usage non-zero sorted
+show processes memory
+show conn
+show conn count
+show dns
+show dns trusted-source detail
 show route
 show running-config
 show run interface
@@ -50,12 +58,15 @@ ping 192.0.2.1
 ping example.com 3
 traceroute 192.0.2.1
 trace route example.com 8
+show system > system.txt
 show startup-config
 show tech-support
 show tech sanitized
 ```
 
 `show tech-support` includes local host diagnostics. Use `show tech sanitized` before sharing output: it removes the most sensitive sections and masks host/user identifiers, paths, serials, MAC addresses, and IP addresses.
+
+`>` saves output from a `show` command to a UTF-8 file in the current directory, for example `show system > system.txt`.
 
 ## Tests
 

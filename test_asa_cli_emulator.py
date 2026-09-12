@@ -6,7 +6,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from asa_cli_emulator import AsaCli, InterfaceInfo, StaticRoute
+from asa_cli_emulator import AsaCli, InterfaceInfo, StaticRoute, WindowsArpEntry, WindowsConnection, WindowsDnsServer
 
 
 def sample_interfaces():
@@ -73,6 +73,63 @@ class AsaCliTests(unittest.TestCase):
                 self.cli._dispatch_line("trace route example.com 8")
         run.assert_called_once_with(["tracert", "-d", "-h", "8", "-w", "1000", "example.com"])
         self.assertIn("Trace output", output.getvalue())
+
+    def test_show_arp_renders_windows_neighbor_with_asa_interface_name(self):
+        entries = [WindowsArpEntry("192.0.2.1", "001122334455", "Reachable", "Ethernet")]
+        with patch("asa_cli_emulator.get_windows_arp_entries", return_value=entries):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.cli._dispatch_line("show arp")
+        rendered = output.getvalue()
+        self.assertIn("192.0.2.1", rendered)
+        self.assertIn("0011.2233.4455", rendered)
+        self.assertIn("GigabitEthernet1/0", rendered)
+
+    def test_show_processes_cpu_usage_accepts_asa_modifiers(self):
+        processes = [{"ProcessName": "cpu-heavy", "Id": 101, "CpuPercent": 25.0, "WorkingSetMB": 64.0}]
+        with patch("asa_cli_emulator.get_top_cpu_processes", return_value=processes):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.cli._dispatch_line("show processes cpu-usage non-zero sorted")
+        rendered = output.getvalue()
+        self.assertIn("5Sec", rendered)
+        self.assertIn("cpu-heavy", rendered)
+
+    def test_show_conn_renders_windows_connection_with_asa_interface_name(self):
+        connections = [WindowsConnection("TCP", "10.0.0.10", 50000, "198.51.100.1", 443, "Established", 1234)]
+        with patch("asa_cli_emulator.get_windows_connections", return_value=connections):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.cli._dispatch_line("show conn")
+        rendered = output.getvalue()
+        self.assertIn("10.0.0.10:50000", rendered)
+        self.assertIn("GigabitEthernet1/0", rendered)
+        self.assertIn("Established", rendered)
+
+    def test_show_dns_renders_configured_windows_dns_servers(self):
+        servers = [WindowsDnsServer("Ethernet", "1.1.1.1")]
+        with patch("asa_cli_emulator.get_windows_dns_servers", return_value=servers):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.cli._dispatch_line("show dns trusted-source detail")
+        rendered = output.getvalue()
+        self.assertIn("1.1.1.1", rendered)
+        self.assertIn("GigabitEthernet1/0", rendered)
+        self.assertIn("Ethernet", rendered)
+
+    def test_show_output_redirection_writes_to_current_directory(self):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.cli._dispatch_line("show hostname > system.txt")
+        self.assertEqual(f"{self.cli.hostname}\n", Path("system.txt").read_text(encoding="utf-8"))
+        self.assertIn("Output written to system.txt", output.getvalue())
+
+    def test_output_redirection_rejects_paths_outside_current_directory(self):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.cli._dispatch_line("show hostname > ..\\system.txt")
+        self.assertIn("current directory", output.getvalue())
+        self.assertFalse(Path("..", "system.txt").exists())
 
     def test_invalid_dhcp_suffix_does_not_apply(self):
         self.enter_interface_mode()
