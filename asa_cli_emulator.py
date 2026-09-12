@@ -335,6 +335,66 @@ class StaticRoute:
     metric: int = 1
 
 
+@dataclass
+class WindowsRoute:
+    destination: str
+    mask: str
+    gateway: str
+    interface_ip: str
+    metric: int
+
+
+def get_windows_ipv4_routes() -> List[WindowsRoute]:
+    output = run_command(["route", "print", "-4"])
+    routes: List[WindowsRoute] = []
+    in_active_routes = False
+
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if line == "Active Routes:":
+            in_active_routes = True
+            continue
+        if line == "Persistent Routes:":
+            break
+        if not in_active_routes or not line or line.startswith("Network Destination"):
+            continue
+
+        parts = line.split()
+        if len(parts) != 5:
+            continue
+
+        destination, mask, gateway, interface_ip, metric_text = parts
+        if not _looks_like_ipv4(destination) or not _looks_like_ipv4(mask) or not _looks_like_ipv4(interface_ip):
+            continue
+        if gateway.lower() != "on-link" and not _looks_like_ipv4(gateway):
+            continue
+
+        try:
+            metric = int(metric_text)
+        except ValueError:
+            continue
+
+        routes.append(
+            WindowsRoute(
+                destination=destination,
+                mask=mask,
+                gateway=gateway,
+                interface_ip=interface_ip,
+                metric=metric,
+            )
+        )
+
+    return routes
+
+
+def _looks_like_ipv4(value: str) -> bool:
+    try:
+        ipaddress.IPv4Address(value)
+        return True
+    except ipaddress.AddressValueError:
+        return False
+
+
 class AsaCli:
     def __init__(self) -> None:
         self.hostname = self._sanitize_hostname(get_hostname())
@@ -1152,6 +1212,24 @@ class AsaCli:
     def _display_interface_name(interface: EmulatedInterface) -> str:
         return interface.nameif or interface.asa_name
 
+    def _interface_name_for_route_ip(self, interface_ip: str) -> str:
+        for interface in self.interfaces.values():
+            if interface.effective_ip() == interface_ip:
+                return self._display_interface_name(interface)
+        return interface_ip
+
+    @staticmethod
+    def _is_interesting_connected_route(route: WindowsRoute) -> bool:
+        if route.gateway.lower() != "on-link":
+            return False
+        if route.destination.startswith("127.") or route.destination.startswith("224."):
+            return False
+        if route.destination == "255.255.255.255" or route.mask == "240.0.0.0":
+            return False
+        if route.mask == "255.255.255.255":
+            return False
+        return True
+
     def _configure_route(self, words: List[str], negate: bool) -> None:
         if len(words) < 5:
             print("% Incomplete command.")
@@ -1297,17 +1375,46 @@ class AsaCli:
         print(f"Working Dir     : {os.getcwd()}")
 
     def _show_route(self) -> None:
-        print("Codes: C - connected, S - static")
-        for interface in self.interfaces.values():
-            ip_address = interface.effective_ip()
-            if ip_address and not interface.shutdown:
-                print(f"C    {ip_address} 255.255.255.255 is directly connected, {self._display_interface_name(interface)}")
+        print("Codes: C - connected, S - static, S* - candidate default")
+        windows_routes = get_windows_ipv4_routes()
+        printed_routes = set()
+
+        for route in windows_routes:
+            if self._is_interesting_connected_route(route):
+                interface_name = self._interface_name_for_route_ip(route.interface_ip)
+                key = ("C", route.destination, route.mask, interface_name)
+                if key in printed_routes:
+                    continue
+                printed_routes.add(key)
+                print(f"C    {route.destination} {route.mask} is directly connected, {interface_name}")
+
         for route in self.static_routes:
             if route.metric == 0:
                 continue
+            code = "S*" if route.destination == "0.0.0.0" and route.mask == "0.0.0.0" else "S "
+            key = (code, route.destination, route.mask, route.gateway, route.interface_name)
+            if key in printed_routes:
+                continue
+            printed_routes.add(key)
             print(
-                f"S    {route.destination} {route.mask} "
-                f"[{route.metric}/0] via {route.gateway}, {route.interface_name}"
+                f"{code}   {route.destination} {route.mask} "
+                f"[1/{route.metric}] via {route.gateway}, {route.interface_name}"
+            )
+
+        for route in windows_routes:
+            if route.gateway.lower() == "on-link":
+                continue
+            if route.destination.startswith("127.") or route.destination.startswith("224."):
+                continue
+            code = "S*" if route.destination == "0.0.0.0" and route.mask == "0.0.0.0" else "S "
+            interface_name = self._interface_name_for_route_ip(route.interface_ip)
+            key = (code, route.destination, route.mask, route.gateway, interface_name)
+            if key in printed_routes:
+                continue
+            printed_routes.add(key)
+            print(
+                f"{code}   {route.destination} {route.mask} "
+                f"[1/{route.metric}] via {route.gateway}, {interface_name}"
             )
 
     def _show_running_config(self) -> None:
@@ -1410,8 +1517,10 @@ class AsaCli:
             print(f"  {self._display_interface_name(interface):18} {ip_address:15} {method}")
 
     def _show_route_summary(self) -> None:
-        connected = sum(1 for interface in self.interfaces.values() if interface.effective_ip() and not interface.shutdown)
+        windows_routes = get_windows_ipv4_routes()
+        connected = sum(1 for route in windows_routes if self._is_interesting_connected_route(route))
         static = sum(1 for route in self.static_routes if route.metric != 0)
+        static += sum(1 for route in windows_routes if route.gateway.lower() != "on-link")
         print("Route Source    Networks    Subnets     Overhead    Memory (bytes)")
         print(f"connected       {connected:<11}0           0           {connected * 128}")
         print(f"static          {static:<11}0           0           {static * 128}")
