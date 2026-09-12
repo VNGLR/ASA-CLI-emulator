@@ -1,4 +1,6 @@
 import ctypes
+import io
+import json
 import getpass
 import ipaddress
 import os
@@ -8,8 +10,10 @@ import shutil
 import socket
 import subprocess
 import sys
+from contextlib import redirect_stdout
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 try:
@@ -384,6 +388,57 @@ def get_windows_ipv4_routes() -> List[WindowsRoute]:
             )
         )
 
+    return routes or _get_windows_ipv4_routes_powershell()
+
+
+def _get_windows_ipv4_routes_powershell() -> List[WindowsRoute]:
+    output = clean_command_output(
+        powershell(
+            "$addressByIndex = @{}; "
+            "Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop | "
+            "Where-Object { $_.IPAddress -notlike '127.*' } | "
+            "ForEach-Object { if (-not $addressByIndex.ContainsKey($_.InterfaceIndex)) { $addressByIndex[$_.InterfaceIndex] = $_.IPAddress } }; "
+            "Get-NetRoute -AddressFamily IPv4 -ErrorAction Stop | "
+            "ForEach-Object { [PSCustomObject]@{DestinationPrefix=$_.DestinationPrefix; NextHop=$_.NextHop; InterfaceIp=$addressByIndex[$_.InterfaceIndex]; RouteMetric=$_.RouteMetric} } | "
+            "ConvertTo-Json -Compress"
+        )
+    )
+    if not output:
+        return []
+
+    try:
+        values = json.loads(output)
+    except json.JSONDecodeError:
+        return []
+    if isinstance(values, dict):
+        values = [values]
+    if not isinstance(values, list):
+        return []
+
+    routes: List[WindowsRoute] = []
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        prefix = value.get("DestinationPrefix")
+        gateway = value.get("NextHop")
+        interface_ip = value.get("InterfaceIp")
+        metric = value.get("RouteMetric")
+        if not isinstance(prefix, str) or not isinstance(gateway, str) or not isinstance(interface_ip, str):
+            continue
+        try:
+            network = ipaddress.IPv4Network(prefix, strict=False)
+            route_metric = int(metric)
+        except (ValueError, TypeError):
+            continue
+        routes.append(
+            WindowsRoute(
+                destination=str(network.network_address),
+                mask=str(network.netmask),
+                gateway="On-link" if gateway == "0.0.0.0" else gateway,
+                interface_ip=interface_ip,
+                metric=route_metric,
+            )
+        )
     return routes
 
 
@@ -407,7 +462,10 @@ class AsaCli:
         self.static_routes: List[StaticRoute] = self._build_default_routes()
         self.history: List[str] = []
         self._last_input_width = 0
+        self.config_path = Path.cwd() / ".asa-cli-emulator-config.json"
+        self.startup_config_text: Optional[str] = None
         self.user_tree, self.enabled_tree, self.config_tree, self.interface_tree = self._build_command_trees()
+        self._load_saved_config()
 
     @staticmethod
     def _sanitize_hostname(name: str) -> str:
@@ -457,6 +515,80 @@ class AsaCli:
                 )
         return routes
 
+    def _config_snapshot(self) -> Dict[str, object]:
+        return {
+            "hostname": self.hostname,
+            "interfaces": {
+                key: {
+                    "description": interface.description,
+                    "nameif": interface.nameif,
+                    "security_level": interface.security_level,
+                    "configured_ip": interface.configured_ip,
+                    "configured_mask": interface.configured_mask,
+                    "dhcp_enabled": interface.dhcp_enabled,
+                    "dhcp_setroute": interface.dhcp_setroute,
+                    "shutdown": interface.shutdown,
+                }
+                for key, interface in self.interfaces.items()
+            },
+            "static_routes": [route.__dict__ for route in self.static_routes if route.metric != 0],
+        }
+
+    def _load_saved_config(self) -> None:
+        if not self.config_path.exists():
+            return
+        try:
+            saved = json.loads(self.config_path.read_text(encoding="utf-8"))
+            config = saved.get("config", {})
+            running_config = saved.get("running_config")
+            if isinstance(running_config, str):
+                self.startup_config_text = running_config
+            hostname = config.get("hostname")
+            if isinstance(hostname, str):
+                self.hostname = self._sanitize_hostname(hostname)
+
+            interface_configs = config.get("interfaces", {})
+            if isinstance(interface_configs, dict):
+                for key, values in interface_configs.items():
+                    if key not in self.interfaces or not isinstance(values, dict):
+                        continue
+                    interface = self.interfaces[key]
+                    for field_name in (
+                        "description",
+                        "nameif",
+                        "security_level",
+                    ):
+                        if field_name in values:
+                            setattr(interface, field_name, values[field_name])
+
+            routes = config.get("static_routes", [])
+            if isinstance(routes, list):
+                self.static_routes = self._build_default_routes()
+                for values in routes:
+                    if not isinstance(values, dict):
+                        continue
+                    try:
+                        self.static_routes.append(StaticRoute(**values))
+                    except TypeError:
+                        continue
+        except (OSError, json.JSONDecodeError):
+            print("% Warning: unable to load saved emulator configuration.")
+
+    def _save_config(self) -> bool:
+        payload = {
+            "format_version": 1,
+            "saved_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "config": self._config_snapshot(),
+            "running_config": self._running_config_text(),
+        }
+        try:
+            self.config_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        except OSError as exc:
+            print(f"% Unable to save startup configuration: {exc}")
+            return False
+        self.startup_config_text = payload["running_config"]
+        return True
+
     def _build_command_trees(self) -> Tuple[CommandNode, CommandNode, CommandNode, CommandNode]:
         user_root = CommandNode("root")
         enabled_root = CommandNode("root")
@@ -498,8 +630,11 @@ class AsaCli:
             self._add_command(root, ["show", "mem"], "Display memory utilization", self._show_memory)
             self._add_command(root, ["show", "tech"], "Display technical support information", self._show_tech)
             self._add_command(root, ["show", "tech-support"], "Display technical support information", self._show_tech)
+            self._add_command(root, ["show", "tech", "sanitized"], "Display sanitized technical support information", self._show_tech_sanitized)
+            self._add_command(root, ["show", "tech-support", "sanitized"], "Display sanitized technical support information", self._show_tech_sanitized)
             self._add_command(root, ["show", "version"], "System software information", self._show_version)
             self._add_command(root, ["show", "running-config"], "Current operating configuration", self._show_running_config)
+            self._add_command(root, ["show", "startup-config"], "Contents of the startup configuration", self._show_startup_config)
             self._add_command(root, ["show", "inventory"], "Hardware and platform inventory", self._show_inventory)
             self._add_command(root, ["show", "hostname"], "Display the device hostname", self._show_hostname)
             self._add_command(root, ["show", "system"], "Display host system information", self._show_system)
@@ -831,7 +966,8 @@ class AsaCli:
 
     def _cmd_write_memory(self) -> None:
         print("Building configuration...")
-        print("[OK]")
+        if self._save_config():
+            print("[OK]")
 
     def _cmd_terminal_length(self) -> None:
         print("% Incomplete command.")
@@ -852,6 +988,8 @@ class AsaCli:
         )
         if not ok:
             self._print_windows_error(output)
+        else:
+            self._refresh_live_state()
         return ok
 
     def _apply_static_ip(self, interface: EmulatedInterface, ip_address: str, mask: str) -> bool:
@@ -873,6 +1011,8 @@ class AsaCli:
         )
         if not ok:
             self._print_windows_error(output)
+        else:
+            self._refresh_live_state()
         return ok
 
     def _apply_dhcp_ip(self, interface: EmulatedInterface) -> bool:
@@ -891,6 +1031,8 @@ class AsaCli:
         )
         if not ok:
             self._print_windows_error(output)
+        else:
+            self._refresh_live_state()
         return ok
 
     def _apply_route(self, interface: EmulatedInterface, route: StaticRoute, negate: bool) -> bool:
@@ -911,7 +1053,7 @@ class AsaCli:
             f"prefix={route.destination}/{prefix_length}",
             f"interface={interface.windows_name}",
             f"nexthop={route.gateway}",
-            "store=active",
+            "store=persistent",
         ]
         if not negate:
             command.insert(-1, f"metric={route.metric}")
@@ -919,7 +1061,43 @@ class AsaCli:
         ok, output = run_live_command(command)
         if not ok:
             self._print_windows_error(output)
+        else:
+            self._refresh_live_state()
         return ok
+
+    def _refresh_live_state(self) -> None:
+        discovered = parse_ipconfig()
+        if not discovered:
+            return
+
+        existing_by_windows_name = {
+            interface.windows_name.lower(): interface
+            for interface in self.interfaces.values()
+        }
+        refreshed: Dict[str, EmulatedInterface] = {}
+        for index, discovered_interface in enumerate(discovered, start=1):
+            existing = existing_by_windows_name.get(discovered_interface.name.lower())
+            if existing is None:
+                asa_name = self._asa_interface_name(index, discovered_interface.name)
+                existing = EmulatedInterface(
+                    asa_name=asa_name,
+                    windows_name=discovered_interface.name,
+                    mac_address=discovered_interface.mac_address,
+                    live_ipv4=None,
+                    live_method="manual",
+                    description=f"Windows adapter: {discovered_interface.name}",
+                )
+
+            existing.mac_address = discovered_interface.mac_address
+            existing.live_ipv4 = discovered_interface.ipv4_addresses[0] if discovered_interface.ipv4_addresses else None
+            existing.live_method = "DHCP" if (discovered_interface.dhcp_enabled or "").lower() == "yes" else "manual"
+            if existing.dhcp_enabled:
+                existing.configured_ip = None
+                existing.configured_mask = None
+            refreshed[existing.asa_name.lower()] = existing
+
+        self.base_interfaces = discovered
+        self.interfaces = refreshed
 
     @staticmethod
     def _ensure_admin() -> bool:
@@ -1114,6 +1292,13 @@ class AsaCli:
         if self._matches(lowered[0], "nameif"):
             if len(words) < 2:
                 print("% Incomplete command.")
+            elif len(words) != 2 or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,47}", words[1]):
+                print("% Invalid interface name.")
+            elif any(
+                other is not interface and other.nameif and other.nameif.lower() == words[1].lower()
+                for other in self.interfaces.values()
+            ):
+                print("% Interface name is already in use.")
             else:
                 interface.nameif = words[1]
             return True, False
@@ -1121,6 +1306,8 @@ class AsaCli:
         if self._matches(lowered[0], "security-level"):
             if len(words) < 2:
                 print("% Incomplete command.")
+            elif len(words) != 2:
+                self._print_invalid_marker(line, line.lower().find(words[2].lower()))
             else:
                 try:
                     value = int(words[1])
@@ -1134,40 +1321,43 @@ class AsaCli:
 
         if self._matches(lowered[0], "ip"):
             if len(words) >= 2 and self._matches(lowered[1], "address"):
-                if len(words) < 4:
-                    if len(words) == 3 and self._matches(words[2].lower(), "dhcp"):
-                        if self._apply_dhcp_ip(interface):
-                            interface.dhcp_enabled = True
-                            interface.dhcp_setroute = False
-                            interface.configured_ip = None
-                            interface.configured_mask = None
-                    else:
-                        print("% Incomplete command.")
-                elif self._matches(words[2].lower(), "dhcp"):
-                    setroute = len(words) > 3 and self._matches(words[3].lower(), "setroute")
+                if len(words) == 3 and words[2].lower() == "dhcp":
                     if self._apply_dhcp_ip(interface):
                         interface.dhcp_enabled = True
-                        interface.dhcp_setroute = setroute
+                        interface.dhcp_setroute = False
                         interface.configured_ip = None
                         interface.configured_mask = None
-                elif self._valid_ipv4(words[2]) and mask_to_prefix(words[3]) is not None:
+                elif len(words) == 4 and words[2].lower() == "dhcp" and words[3].lower() == "setroute":
+                    if self._apply_dhcp_ip(interface):
+                        interface.dhcp_enabled = True
+                        interface.dhcp_setroute = True
+                        interface.configured_ip = None
+                        interface.configured_mask = None
+                elif len(words) == 4 and self._valid_ipv4(words[2]) and mask_to_prefix(words[3]) is not None:
                     if self._apply_static_ip(interface, words[2], words[3]):
                         interface.configured_ip = words[2]
                         interface.configured_mask = words[3]
                         interface.dhcp_enabled = False
                         interface.dhcp_setroute = False
+                elif len(words) < 4:
+                    print("% Incomplete command.")
                 else:
                     print("% Invalid IP address or subnet mask.")
                 return True, False
 
         if self._matches(lowered[0], "shutdown"):
-            if self._apply_interface_admin_state(interface, enabled=False):
+            if len(words) != 1:
+                self._print_invalid_marker(line, line.lower().find(words[1].lower()))
+            elif self._apply_interface_admin_state(interface, enabled=False):
                 interface.shutdown = True
             return True, False
 
         if self._matches(lowered[0], "no"):
             if len(words) < 2:
                 print("% Incomplete command.")
+                return True, False
+            if len(words) != 2:
+                self._print_invalid_marker(line, line.lower().find(words[2].lower()))
                 return True, False
             target = lowered[1]
             if self._matches(target, "shutdown"):
@@ -1234,6 +1424,9 @@ class AsaCli:
         if len(words) < 5:
             print("% Incomplete command.")
             return
+        if len(words) > 6:
+            self._print_invalid_marker(" ".join(words), len(" ".join(words[:6])) + 1)
+            return
 
         interface_key = self._resolve_interface_name(words[1])
         if interface_key is None:
@@ -1248,9 +1441,16 @@ class AsaCli:
             except ValueError:
                 print("% Invalid route metric.")
                 return
+            if not 1 <= metric <= 255:
+                print("% Route metric must be between 1 and 255.")
+                return
 
-        if not all(self._valid_ipv4(value) for value in (destination, mask, gateway)):
+        if not self._valid_ipv4(destination) or mask_to_prefix(mask) is None or not self._valid_ipv4(gateway):
             print("% Invalid route parameters.")
+            return
+        network = ipaddress.IPv4Network(f"{destination}/{mask}", strict=False)
+        if str(network.network_address) != destination:
+            print("% Route destination must be a network address for the specified netmask.")
             return
 
         interface = self.interfaces[interface_key]
@@ -1281,8 +1481,11 @@ class AsaCli:
         if existing:
             if existing[0].metric == metric:
                 return
-            if self._apply_route(interface, existing[0], negate=True) and self._apply_route(interface, route, negate=False):
-                existing[0].metric = metric
+            if self._apply_route(interface, existing[0], negate=True):
+                if self._apply_route(interface, route, negate=False):
+                    existing[0].metric = metric
+                elif not self._apply_route(interface, existing[0], negate=False):
+                    print("% Warning: route metric update failed and the original route could not be restored.")
             return
 
         if self._apply_route(interface, route, negate=False):
@@ -1468,6 +1671,12 @@ class AsaCli:
             print(f"route {route.interface_name} {route.destination} {route.mask} {route.gateway} {route.metric}")
         print("service-policy global_policy global")
 
+    def _running_config_text(self) -> str:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self._show_running_config()
+        return output.getvalue().rstrip()
+
     def _show_clock_detail(self) -> None:
         now = datetime.now().astimezone()
         print(now.strftime("%H:%M:%S.%f")[:-3] + " " + now.tzname() + " " + now.strftime("%a %b %d %Y"))
@@ -1475,10 +1684,10 @@ class AsaCli:
         print(f"UTC offset is {now.strftime('%z')}")
 
     def _show_startup_config(self) -> None:
-        print(": Startup configuration is emulated from the current running configuration")
-        print(": A persistent startup-config store has not been configured")
-        print("!")
-        self._show_running_config()
+        if self.startup_config_text is None:
+            print("% No startup configuration has been saved.")
+            return
+        print(self.startup_config_text)
 
     def _show_module_detail(self) -> None:
         print('Mod  Card Type                                    Model              Serial No.')
@@ -1655,7 +1864,7 @@ class AsaCli:
         print("=" * 72)
         action()
 
-    def _show_tech(self) -> None:
+    def _show_tech_bundle(self, include_sensitive: bool) -> None:
         print("Cisco Adaptive Security Appliance show tech-support")
         print("Output captured by ASA CLI emulator for Windows")
         print(f"Generated: {datetime.now().astimezone().isoformat(sep=' ', timespec='seconds')}")
@@ -1673,7 +1882,6 @@ class AsaCli:
             ("show ip address", self._show_ip_address),
             ("show route", self._show_route),
             ("show route-summary", self._show_route_summary),
-            ("show arp", self._show_arp),
             ("show conn count", self._show_conn_count),
             ("show xlate count", self._show_xlate_count),
             ("show access-list", self._show_access_list),
@@ -1682,9 +1890,7 @@ class AsaCli:
             ("show cpu detail", self._show_cpu),
             ("show processes cpu-usage non-zero sorted", self._show_processes_cpu),
             ("show memory detail", self._show_memory),
-            ("show processes memory", self._show_processes_memory),
             ("show blocks", self._show_blocks),
-            ("dir all-filesystems", self._show_filesystems),
             ("show logging", self._show_logging_tail),
             ("show resource usage count all 1", self._show_resource_usage),
             ("show failover", self._show_failover),
@@ -1692,11 +1898,44 @@ class AsaCli:
             ("show crypto ikev1 stats", self._show_vpn_stats),
             ("show asp drop", self._show_asp_drop),
             ("show environment", self._show_environment),
-            ("show history", self._show_history),
         ]
+
+        if include_sensitive:
+            sections.extend(
+                [
+                    ("show arp", self._show_arp),
+                    ("show processes memory", self._show_processes_memory),
+                    ("dir all-filesystems", self._show_filesystems),
+                    ("show history", self._show_history),
+                ]
+            )
 
         for command, action in sections:
             self._tech_section(command, action)
+
+    def _show_tech(self) -> None:
+        self._show_tech_bundle(include_sensitive=True)
+
+    def _show_tech_sanitized(self) -> None:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self._show_tech_bundle(include_sensitive=False)
+        print(self._sanitize_tech_output(output.getvalue()).rstrip())
+
+    def _sanitize_tech_output(self, output: str) -> str:
+        sanitized = output.replace(self.hostname, "<redacted-host>")
+        sanitized = sanitized.replace(self.username, "<redacted-user>")
+        sanitized = sanitized.replace(os.getcwd(), "<redacted-path>")
+        sanitized = re.sub(r"(?im)^(.*(?:serial number|serial:|\bSN:).*)$", "<redacted-serial>", sanitized)
+        sanitized = re.sub(r"(?im)^\s*(?:description|Description:).*?$", "  <redacted-description>", sanitized)
+        sanitized = re.sub(r"(?im)^Working Dir\s*:.*$", "Working Dir     : <redacted-path>", sanitized)
+        sanitized = re.sub(r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b", "<redacted-mac>", sanitized)
+
+        def mask_ip(match: re.Match[str]) -> str:
+            value = match.group(0)
+            return value if value in {"0.0.0.0", "255.255.255.255"} else "<redacted-ip>"
+
+        return re.sub(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", mask_ip, sanitized)
 
     @staticmethod
     def _asa_interface_name(index: int, source_name: str) -> str:
