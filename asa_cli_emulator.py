@@ -829,7 +829,7 @@ class AsaCli:
             while True:
                 char = os.read(file_descriptor, 1).decode("utf-8", errors="ignore")
                 if char in ("\r", "\n"):
-                    print()
+                    self._write_raw_newline()
                     if buffer.strip() and (not self.history or self.history[-1] != buffer):
                         self.history.append(buffer)
                     return buffer
@@ -890,6 +890,11 @@ class AsaCli:
         if backtrack:
             print("\b" * backtrack, end="", flush=True)
 
+    @staticmethod
+    def _write_raw_newline() -> None:
+        """Move to the next terminal row and reset to its first column in raw mode."""
+        print("\r\n", end="", flush=True)
+
     def _handle_tab(self, buffer: str, cursor: int) -> Tuple[str, int]:
         prefix = buffer[:cursor]
         suffix = buffer[cursor:]
@@ -904,7 +909,7 @@ class AsaCli:
                 print(addition, end="", flush=True)
             return new_buffer, new_cursor
         if suggestions:
-            print()
+            self._write_raw_newline()
             self._print_columns(suggestions)
             print(self.prompt + buffer, end="", flush=True)
             backtrack = len(buffer) - cursor
@@ -1394,7 +1399,8 @@ class AsaCli:
     @staticmethod
     def _print_columns(items: List[str]) -> None:
         for item in items:
-            print(item)
+            # Raw POSIX mode disables the terminal's normal LF-to-CRLF conversion.
+            print(item, end="\r\n", flush=True)
 
     @staticmethod
     def _print_invalid_marker(line: str, index: int) -> None:

@@ -45,6 +45,12 @@ class LinuxAsaCliTests(unittest.TestCase):
         self.assertEqual("show run interface GigabitEthernet", completed)
         self.assertEqual(2, len(suggestions))
 
+    def test_raw_terminal_newline_resets_the_cursor_column(self):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.cli._write_raw_newline()
+        self.assertEqual("\r\n", output.getvalue())
+
     def test_ping_uses_linux_count_syntax(self):
         with patch("asa_cli_emulator.run_command", return_value="PING reply") as run:
             self.cli._dispatch_line("ping 192.0.2.1 2")
