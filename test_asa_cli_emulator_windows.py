@@ -6,7 +6,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from asa_cli_emulator import AsaCli, InterfaceInfo, StaticRoute, WindowsArpEntry, WindowsConnection, WindowsDnsServer
+from asa_cli_emulator_windows import AsaCli, InterfaceInfo, StaticRoute, WindowsArpEntry, WindowsConnection, WindowsDnsServer
 
 
 def sample_interfaces():
@@ -31,7 +31,7 @@ class AsaCliTests(unittest.TestCase):
         self.tempdir = tempfile.TemporaryDirectory()
         self.previous_directory = os.getcwd()
         os.chdir(self.tempdir.name)
-        self.parse_patch = patch("asa_cli_emulator.parse_ipconfig", return_value=sample_interfaces())
+        self.parse_patch = patch("asa_cli_emulator_windows.parse_ipconfig", return_value=sample_interfaces())
         self.parse_patch.start()
         self.cli = AsaCli()
 
@@ -59,7 +59,7 @@ class AsaCliTests(unittest.TestCase):
         self.assertEqual(2, len(suggestions))
 
     def test_ping_invokes_windows_ping_with_repeat_count(self):
-        with patch("asa_cli_emulator.run_command", return_value="Ping reply") as run:
+        with patch("asa_cli_emulator_windows.run_command", return_value="Ping reply") as run:
             output = io.StringIO()
             with redirect_stdout(output):
                 self.cli._dispatch_line("ping 192.0.2.1 2")
@@ -67,7 +67,7 @@ class AsaCliTests(unittest.TestCase):
         self.assertIn("Ping reply", output.getvalue())
 
     def test_trace_route_invokes_windows_tracert_with_hop_limit(self):
-        with patch("asa_cli_emulator.run_command", return_value="Trace output") as run:
+        with patch("asa_cli_emulator_windows.run_command", return_value="Trace output") as run:
             output = io.StringIO()
             with redirect_stdout(output):
                 self.cli._dispatch_line("trace route example.com 8")
@@ -76,7 +76,7 @@ class AsaCliTests(unittest.TestCase):
 
     def test_show_arp_renders_windows_neighbor_with_asa_interface_name(self):
         entries = [WindowsArpEntry("192.0.2.1", "001122334455", "Reachable", "Ethernet")]
-        with patch("asa_cli_emulator.get_windows_arp_entries", return_value=entries):
+        with patch("asa_cli_emulator_windows.get_windows_arp_entries", return_value=entries):
             output = io.StringIO()
             with redirect_stdout(output):
                 self.cli._dispatch_line("show arp")
@@ -87,7 +87,7 @@ class AsaCliTests(unittest.TestCase):
 
     def test_show_processes_cpu_usage_accepts_asa_modifiers(self):
         processes = [{"ProcessName": "cpu-heavy", "Id": 101, "CpuPercent": 25.0, "WorkingSetMB": 64.0}]
-        with patch("asa_cli_emulator.get_top_cpu_processes", return_value=processes):
+        with patch("asa_cli_emulator_windows.get_top_cpu_processes", return_value=processes):
             output = io.StringIO()
             with redirect_stdout(output):
                 self.cli._dispatch_line("show processes cpu-usage non-zero sorted")
@@ -97,7 +97,7 @@ class AsaCliTests(unittest.TestCase):
 
     def test_show_conn_renders_windows_connection_with_asa_interface_name(self):
         connections = [WindowsConnection("TCP", "10.0.0.10", 50000, "198.51.100.1", 443, "Established", 1234)]
-        with patch("asa_cli_emulator.get_windows_connections", return_value=connections):
+        with patch("asa_cli_emulator_windows.get_windows_connections", return_value=connections):
             output = io.StringIO()
             with redirect_stdout(output):
                 self.cli._dispatch_line("show conn")
@@ -111,7 +111,7 @@ class AsaCliTests(unittest.TestCase):
             WindowsConnection("TCP", "10.0.0.10", 50000, "198.51.100.1", 443, "Established", 1234),
             WindowsConnection("UDP", "10.0.0.10", 5353, "224.0.0.251", 5353, "ACTIVE", 4321),
         ]
-        with patch("asa_cli_emulator.get_windows_connections", return_value=connections):
+        with patch("asa_cli_emulator_windows.get_windows_connections", return_value=connections):
             output = io.StringIO()
             with redirect_stdout(output):
                 self.cli._dispatch_line(
@@ -129,7 +129,7 @@ class AsaCliTests(unittest.TestCase):
 
     def test_show_dns_renders_configured_windows_dns_servers(self):
         servers = [WindowsDnsServer("Ethernet", "1.1.1.1")]
-        with patch("asa_cli_emulator.get_windows_dns_servers", return_value=servers):
+        with patch("asa_cli_emulator_windows.get_windows_dns_servers", return_value=servers):
             output = io.StringIO()
             with redirect_stdout(output):
                 self.cli._dispatch_line("show dns trusted-source detail")
@@ -206,7 +206,7 @@ class AsaCliTests(unittest.TestCase):
 
     def test_show_cpu_detail_displays_top_processes(self):
         processes = [{"ProcessName": "cpu-heavy", "Id": 100, "CpuPercent": 42.5, "WorkingSetMB": 128.0}]
-        with patch("asa_cli_emulator.get_top_cpu_processes", return_value=processes):
+        with patch("asa_cli_emulator_windows.get_top_cpu_processes", return_value=processes):
             output = io.StringIO()
             with redirect_stdout(output):
                 self.cli._dispatch_line("show cpu detail 1")
@@ -215,7 +215,7 @@ class AsaCliTests(unittest.TestCase):
 
     def test_show_memory_detail_displays_top_processes(self):
         processes = [{"ProcessName": "memory-heavy", "Id": 200, "WorkingSetMB": 512.0, "PagedMemoryMB": 256.0, "Handles": 12}]
-        with patch("asa_cli_emulator.get_top_memory_processes", return_value=processes):
+        with patch("asa_cli_emulator_windows.get_top_memory_processes", return_value=processes):
             output = io.StringIO()
             with redirect_stdout(output):
                 self.cli._dispatch_line("show mem detail 1")

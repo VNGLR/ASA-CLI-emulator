@@ -1,3 +1,4 @@
 __pycache__/
 *.py[cod]
 .asa-cli-emulator-config.json
+.asa-cli-emulator-linux-config.json

@@ -1,3 +1,4 @@
+import ctypes
 import io
 import json
 import getpass
@@ -9,7 +10,6 @@ import shutil
 import socket
 import subprocess
 import sys
-import time
 from contextlib import redirect_stdout
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -17,11 +17,9 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 try:
-    import termios
-    import tty
+    import msvcrt
 except ImportError:
-    termios = None
-    tty = None
+    msvcrt = None
 
 
 def run_command(command: List[str]) -> str:
@@ -56,6 +54,19 @@ def run_live_command(command: List[str]) -> Tuple[bool, str]:
     return completed.returncode == 0, output
 
 
+def powershell(command: str) -> str:
+    return run_command(
+        [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            command,
+        ]
+    )
+
+
 def clean_command_output(value: str) -> str:
     text = (value or "").strip()
     lowered = text.lower()
@@ -67,7 +78,10 @@ def clean_command_output(value: str) -> str:
 
 
 def is_admin() -> bool:
-    return hasattr(os, "geteuid") and os.geteuid() == 0
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except OSError:
+        return False
 
 
 def mask_to_prefix(mask: str) -> Optional[int]:
@@ -87,51 +101,50 @@ class InterfaceInfo:
     status: str = "up"
 
 
-def parse_linux_interfaces() -> List[InterfaceInfo]:
-    """Discover Linux interfaces using iproute2's stable JSON output."""
-    output = run_command(["ip", "-j", "address", "show"])
-    try:
-        values = json.loads(output)
-    except json.JSONDecodeError:
-        values = []
+def parse_ipconfig() -> List[InterfaceInfo]:
+    output = run_command(["ipconfig", "/all"])
+    if not output:
+        return []
 
     interfaces: List[InterfaceInfo] = []
-    if isinstance(values, list):
-        for value in values:
-            if not isinstance(value, dict):
-                continue
-            name = value.get("ifname")
-            if not isinstance(name, str) or name == "lo":
-                continue
-            addresses = value.get("addr_info", [])
-            ipv4 = [item.get("local") for item in addresses if isinstance(item, dict) and item.get("family") == "inet"]
-            ipv6 = [item.get("local") for item in addresses if isinstance(item, dict) and item.get("family") == "inet6"]
-            status = "up" if "UP" in value.get("flags", []) else "administratively down"
-            interfaces.append(
-                InterfaceInfo(
-                    name=name,
-                    mac_address=str(value.get("address") or "unassigned"),
-                    ipv4_addresses=[address for address in ipv4 if isinstance(address, str)],
-                    ipv6_addresses=[address for address in ipv6 if isinstance(address, str)],
-                    dhcp_enabled="No",
-                    status=status,
-                )
-            )
-    if interfaces:
-        return interfaces
+    current: Optional[InterfaceInfo] = None
 
-    sysfs_root = Path("/sys/class/net")
-    if not sysfs_root.exists():
-        return []
-    for entry in sorted(sysfs_root.iterdir()):
-        if entry.name == "lo":
+    for raw_line in output.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
             continue
-        try:
-            mac_address = (entry / "address").read_text(encoding="utf-8").strip()
-            status = "up" if (entry / "operstate").read_text(encoding="utf-8").strip() == "up" else "administratively down"
-        except OSError:
-            mac_address, status = "unassigned", "administratively down"
-        interfaces.append(InterfaceInfo(name=entry.name, mac_address=mac_address, dhcp_enabled="No", status=status))
+
+        header = re.match(
+            r"^(?:Ethernet adapter|Wireless LAN adapter|Unknown adapter|PPP adapter|Tunnel adapter) (.+):$",
+            stripped,
+        )
+        if header:
+            if current:
+                interfaces.append(current)
+            current = InterfaceInfo(name=header.group(1))
+            continue
+
+        if current is None or ":" not in stripped:
+            continue
+
+        key, value = stripped.split(":", 1)
+        key = key.replace(".", "").strip().lower()
+        value = value.strip()
+
+        if key == "physical address":
+            current.mac_address = value or "unassigned"
+        elif key == "dhcp enabled":
+            current.dhcp_enabled = value or None
+        elif key.startswith("ipv4 address"):
+            current.ipv4_addresses.append(value.replace("(Preferred)", "").strip())
+        elif key.startswith("ipv6 address") or key.startswith("temporary ipv6 address") or key.startswith("link-local ipv6 address"):
+            current.ipv6_addresses.append(value.replace("(Preferred)", "").strip())
+        elif key == "media state" and "disconnected" in value.lower():
+            current.status = "administratively down"
+
+    if current:
+        interfaces.append(current)
+
     return interfaces
 
 
@@ -144,7 +157,7 @@ def get_domain() -> str:
     hostname = get_hostname()
     if fqdn and fqdn != hostname and "." in fqdn:
         return fqdn.split(".", 1)[1]
-    return "localdomain"
+    return "WORKGROUP"
 
 
 def get_primary_ipv4() -> str:
@@ -157,95 +170,121 @@ def get_primary_ipv4() -> str:
 
 
 def get_os_caption() -> str:
-    try:
-        values = dict(
-            line.split("=", 1) for line in Path("/etc/os-release").read_text(encoding="utf-8").splitlines()
-            if "=" in line
-        )
-        return values.get("PRETTY_NAME", "").strip('"') or f"Linux {platform.release()}"
-    except OSError:
-        return f"Linux {platform.release()}"
-
-
-def _read_system_value(*paths: str) -> str:
-    for path in paths:
-        try:
-            value = Path(path).read_text(encoding="utf-8", errors="replace").strip()
-        except OSError:
-            continue
-        if value:
-            return value
-    return ""
+    return f"{platform.system()} {platform.release()} build {platform.version()}"
 
 
 def get_serial_number() -> str:
-    return _read_system_value("/sys/class/dmi/id/product_serial", "/sys/class/dmi/id/board_serial") or "Unknown"
+    serial = clean_command_output(powershell("(Get-CimInstance Win32_BIOS).SerialNumber"))
+    return serial or "Unknown"
 
 
 def get_model() -> str:
-    return _read_system_value("/sys/class/dmi/id/product_name", "/sys/devices/virtual/dmi/id/product_name") or platform.node() or "Linux Device"
+    model = clean_command_output(powershell("(Get-CimInstance Win32_ComputerSystem).Model"))
+    return model or platform.node() or "Windows Device"
 
 
 def get_manufacturer() -> str:
-    return _read_system_value("/sys/class/dmi/id/sys_vendor", "/sys/devices/virtual/dmi/id/sys_vendor") or "Unknown"
+    manufacturer = clean_command_output(powershell("(Get-CimInstance Win32_ComputerSystem).Manufacturer"))
+    return manufacturer or "Unknown"
 
 
 def get_total_memory_gb() -> str:
-    snapshot = get_memory_snapshot()
-    return f"{snapshot['total_gb']:.2f}" if snapshot else "Unknown"
+    class MemoryStatus(ctypes.Structure):
+        _fields_ = [
+            ("dwLength", ctypes.c_ulong),
+            ("dwMemoryLoad", ctypes.c_ulong),
+            ("ullTotalPhys", ctypes.c_ulonglong),
+            ("ullAvailPhys", ctypes.c_ulonglong),
+            ("ullTotalPageFile", ctypes.c_ulonglong),
+            ("ullAvailPageFile", ctypes.c_ulonglong),
+            ("ullTotalVirtual", ctypes.c_ulonglong),
+            ("ullAvailVirtual", ctypes.c_ulonglong),
+            ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+        ]
+
+    status = MemoryStatus()
+    status.dwLength = ctypes.sizeof(MemoryStatus)
+    if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        return f"{status.ullTotalPhys / (1024 ** 3):.2f}"
+    return "Unknown"
 
 
 def get_memory_snapshot() -> Dict[str, float]:
-    try:
-        values = {}
-        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
-            key, value = line.split(":", 1)
-            values[key] = int(value.strip().split()[0]) * 1024
-        total = values["MemTotal"]
-        available = values.get("MemAvailable", values.get("MemFree", 0))
-    except (OSError, KeyError, ValueError):
+    class MemoryStatus(ctypes.Structure):
+        _fields_ = [
+            ("dwLength", ctypes.c_ulong),
+            ("dwMemoryLoad", ctypes.c_ulong),
+            ("ullTotalPhys", ctypes.c_ulonglong),
+            ("ullAvailPhys", ctypes.c_ulonglong),
+            ("ullTotalPageFile", ctypes.c_ulonglong),
+            ("ullAvailPageFile", ctypes.c_ulonglong),
+            ("ullTotalVirtual", ctypes.c_ulonglong),
+            ("ullAvailVirtual", ctypes.c_ulonglong),
+            ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+        ]
+
+    status = MemoryStatus()
+    status.dwLength = ctypes.sizeof(MemoryStatus)
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
         return {}
+
     return {
-        "load_percent": ((total - available) / total) * 100,
-        "total_gb": total / (1024 ** 3),
-        "available_gb": available / (1024 ** 3),
-        "used_gb": (total - available) / (1024 ** 3),
-        "total_virtual_gb": (total + values.get("SwapTotal", 0)) / (1024 ** 3),
-        "available_virtual_gb": (available + values.get("SwapFree", 0)) / (1024 ** 3),
+        "load_percent": float(status.dwMemoryLoad),
+        "total_gb": status.ullTotalPhys / (1024 ** 3),
+        "available_gb": status.ullAvailPhys / (1024 ** 3),
+        "used_gb": (status.ullTotalPhys - status.ullAvailPhys) / (1024 ** 3),
+        "total_virtual_gb": status.ullTotalVirtual / (1024 ** 3),
+        "available_virtual_gb": status.ullAvailVirtual / (1024 ** 3),
     }
 
 
 def get_uptime_string() -> str:
-    try:
-        seconds = int(float(Path("/proc/uptime").read_text(encoding="utf-8").split()[0]))
-    except (OSError, ValueError, IndexError):
-        return "Unknown"
-    days, seconds = divmod(seconds, 86400)
-    hours, seconds = divmod(seconds, 3600)
-    minutes, _ = divmod(seconds, 60)
-    return f"{days} days, {hours} hours, {minutes} minutes"
+    if hasattr(ctypes.windll.kernel32, "GetTickCount64"):
+        milliseconds = ctypes.windll.kernel32.GetTickCount64()
+        seconds = milliseconds // 1000
+        days, seconds = divmod(seconds, 86400)
+        hours, seconds = divmod(seconds, 3600)
+        minutes, _ = divmod(seconds, 60)
+        return f"{days} days, {hours} hours, {minutes} minutes"
+    return "Unknown"
 
 
 def get_cpu_snapshot(sample_seconds: float = 0.2) -> Dict[str, float]:
-    def read_times() -> Optional[Tuple[int, int]]:
-        try:
-            values = [int(value) for value in Path("/proc/stat").read_text(encoding="utf-8").splitlines()[0].split()[1:]]
-        except (OSError, ValueError, IndexError):
+    class FileTime(ctypes.Structure):
+        _fields_ = [("dwLowDateTime", ctypes.c_ulong), ("dwHighDateTime", ctypes.c_ulong)]
+
+    def read_times() -> Optional[Tuple[int, int, int]]:
+        idle = FileTime()
+        kernel = FileTime()
+        user = FileTime()
+        ok = ctypes.windll.kernel32.GetSystemTimes(
+            ctypes.byref(idle),
+            ctypes.byref(kernel),
+            ctypes.byref(user),
+        )
+        if not ok:
             return None
-        return sum(values), values[3] + (values[4] if len(values) > 4 else 0)
+
+        def to_int(value: FileTime) -> int:
+            return (value.dwHighDateTime << 32) | value.dwLowDateTime
+
+        return to_int(idle), to_int(kernel), to_int(user)
 
     start = read_times()
     if start is None:
         return {}
-    time.sleep(sample_seconds)
+    ctypes.windll.kernel32.Sleep(int(sample_seconds * 1000))
     end = read_times()
     if end is None:
         return {}
 
-    total_delta = end[0] - start[0]
-    idle_delta = end[1] - start[1]
+    idle_delta = end[0] - start[0]
+    kernel_delta = end[1] - start[1]
+    user_delta = end[2] - start[2]
+    total_delta = kernel_delta + user_delta
     if total_delta <= 0:
         return {}
+
     busy_percent = max(0.0, min(100.0, (1.0 - (idle_delta / total_delta)) * 100.0))
     return {
         "usage_percent": busy_percent,
@@ -269,7 +308,7 @@ class CommandNode:
 @dataclass
 class EmulatedInterface:
     asa_name: str
-    linux_name: str
+    windows_name: str
     mac_address: str
     live_ipv4: Optional[str]
     live_method: str
@@ -301,7 +340,7 @@ class StaticRoute:
 
 
 @dataclass
-class LinuxRoute:
+class WindowsRoute:
     destination: str
     mask: str
     gateway: str
@@ -310,47 +349,102 @@ class LinuxRoute:
 
 
 @dataclass
-class LinuxArpEntry:
+class WindowsArpEntry:
     address: str
     mac_address: str
     state: str
     interface_alias: str
 
 
-def get_linux_ipv4_routes() -> List[LinuxRoute]:
-    output = run_command(["ip", "-j", "-4", "route", "show", "table", "all"])
+def get_windows_ipv4_routes() -> List[WindowsRoute]:
+    output = run_command(["route", "print", "-4"])
+    routes: List[WindowsRoute] = []
+    in_active_routes = False
+
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if line == "Active Routes:":
+            in_active_routes = True
+            continue
+        if line == "Persistent Routes:":
+            break
+        if not in_active_routes or not line or line.startswith("Network Destination"):
+            continue
+
+        parts = line.split()
+        if len(parts) != 5:
+            continue
+
+        destination, mask, gateway, interface_ip, metric_text = parts
+        if not _looks_like_ipv4(destination) or not _looks_like_ipv4(mask) or not _looks_like_ipv4(interface_ip):
+            continue
+        if gateway.lower() != "on-link" and not _looks_like_ipv4(gateway):
+            continue
+
+        try:
+            metric = int(metric_text)
+        except ValueError:
+            continue
+
+        routes.append(
+            WindowsRoute(
+                destination=destination,
+                mask=mask,
+                gateway=gateway,
+                interface_ip=interface_ip,
+                metric=metric,
+            )
+        )
+
+    return routes or _get_windows_ipv4_routes_powershell()
+
+
+def _get_windows_ipv4_routes_powershell() -> List[WindowsRoute]:
+    output = clean_command_output(
+        powershell(
+            "$addressByIndex = @{}; "
+            "Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop | "
+            "Where-Object { $_.IPAddress -notlike '127.*' } | "
+            "ForEach-Object { if (-not $addressByIndex.ContainsKey($_.InterfaceIndex)) { $addressByIndex[$_.InterfaceIndex] = $_.IPAddress } }; "
+            "Get-NetRoute -AddressFamily IPv4 -ErrorAction Stop | "
+            "ForEach-Object { [PSCustomObject]@{DestinationPrefix=$_.DestinationPrefix; NextHop=$_.NextHop; InterfaceIp=$addressByIndex[$_.InterfaceIndex]; RouteMetric=$_.RouteMetric} } | "
+            "ConvertTo-Json -Compress"
+        )
+    )
+    if not output:
+        return []
+
     try:
         values = json.loads(output)
     except json.JSONDecodeError:
         return []
+    if isinstance(values, dict):
+        values = [values]
     if not isinstance(values, list):
         return []
 
-    interface_addresses = {
-        interface.name: (interface.ipv4_addresses[0] if interface.ipv4_addresses else interface.name)
-        for interface in parse_linux_interfaces()
-    }
-    routes: List[LinuxRoute] = []
+    routes: List[WindowsRoute] = []
     for value in values:
         if not isinstance(value, dict):
             continue
-        destination = value.get("dst", "default")
-        device = value.get("dev", "")
-        if not isinstance(destination, str) or not isinstance(device, str):
+        prefix = value.get("DestinationPrefix")
+        gateway = value.get("NextHop")
+        interface_ip = value.get("InterfaceIp")
+        metric = value.get("RouteMetric")
+        if not isinstance(prefix, str) or not isinstance(gateway, str) or not isinstance(interface_ip, str):
             continue
         try:
-            network = ipaddress.IPv4Network("0.0.0.0/0" if destination == "default" else destination, strict=False)
-            metric = int(value.get("metric", 0))
+            network = ipaddress.IPv4Network(prefix, strict=False)
+            route_metric = int(metric)
         except (ValueError, TypeError):
             continue
-        gateway = value.get("gateway")
         routes.append(
-            LinuxRoute(
+            WindowsRoute(
                 destination=str(network.network_address),
                 mask=str(network.netmask),
-                gateway=str(gateway) if isinstance(gateway, str) else "On-link",
-                interface_ip=str(value.get("prefsrc") or interface_addresses.get(device, device)),
-                metric=metric,
+                gateway="On-link" if gateway == "0.0.0.0" else gateway,
+                interface_ip=interface_ip,
+                metric=route_metric,
             )
         )
     return routes
@@ -364,20 +458,17 @@ def _looks_like_ipv4(value: str) -> bool:
         return False
 
 
-def get_linux_arp_entries() -> List[LinuxArpEntry]:
-    output = run_command(["ip", "-j", "neigh", "show"])
-    try:
-        values = json.loads(output)
-    except json.JSONDecodeError:
-        values = []
-    entries: List[LinuxArpEntry] = []
+def get_windows_arp_entries() -> List[WindowsArpEntry]:
+    values = powershell_json_array(
+        "Get-NetNeighbor -AddressFamily IPv4 -ErrorAction SilentlyContinue | "
+        "Select-Object IPAddress,LinkLayerAddress,State,InterfaceAlias | ConvertTo-Json -Compress"
+    )
+    entries: List[WindowsArpEntry] = []
     for value in values:
-        if not isinstance(value, dict):
-            continue
-        address = value.get("dst")
-        mac_address = value.get("lladdr")
-        state = value.get("state")
-        interface_alias = value.get("dev")
+        address = value.get("IPAddress")
+        mac_address = value.get("LinkLayerAddress")
+        state = value.get("State")
+        interface_alias = value.get("InterfaceAlias")
         if not isinstance(address, str) or not _looks_like_ipv4(address):
             continue
         if not isinstance(mac_address, str) or not isinstance(interface_alias, str):
@@ -386,7 +477,7 @@ def get_linux_arp_entries() -> List[LinuxArpEntry]:
         if len(compact_mac) != 12 or compact_mac == "000000000000":
             continue
         entries.append(
-            LinuxArpEntry(
+            WindowsArpEntry(
                 address=address,
                 mac_address=compact_mac.upper(),
                 state=str(state or "Unknown"),
@@ -396,62 +487,51 @@ def get_linux_arp_entries() -> List[LinuxArpEntry]:
     return sorted(entries, key=lambda entry: (ipaddress.IPv4Address(entry.address), entry.interface_alias.lower()))
 
 
-def _parse_cpu_time(value: str) -> float:
+def powershell_json_array(command: str) -> List[Dict[str, object]]:
+    output = clean_command_output(powershell(command))
+    if not output:
+        return []
     try:
-        days = 0
-        if "-" in value:
-            day_text, value = value.split("-", 1)
-            days = int(day_text)
-        hours, minutes, seconds = (int(part) for part in value.split(":"))
-        return float(days * 86400 + hours * 3600 + minutes * 60 + seconds)
-    except ValueError:
-        return 0.0
-
-
-def _get_linux_processes(sort: str, limit: int) -> List[Dict[str, object]]:
-    output = run_command(
-        [
-            "ps", "-eo", "comm=,pid=,pcpu=,rss=,vsz=,nlwp=,time=",
-            f"--sort={sort}",
-        ]
-    )
-    processes: List[Dict[str, object]] = []
-    for line in output.splitlines()[:limit]:
-        parts = line.split()
-        if len(parts) != 7:
-            continue
-        name, process_id, cpu_percent, rss_kb, vsz_kb, threads, cpu_time = parts
-        try:
-            processes.append(
-                {
-                    "ProcessName": name,
-                    "Id": int(process_id),
-                    "CpuPercent": float(cpu_percent),
-                    "CPU": _parse_cpu_time(cpu_time),
-                    "WorkingSetMB": round(int(rss_kb) / 1024, 1),
-                    "PagedMemoryMB": round(int(vsz_kb) / 1024, 1),
-                    "Handles": int(threads),
-                }
-            )
-        except ValueError:
-            continue
-    return processes
+        values = json.loads(output)
+    except json.JSONDecodeError:
+        return []
+    if isinstance(values, dict):
+        values = [values]
+    return [value for value in values if isinstance(value, dict)] if isinstance(values, list) else []
 
 
 def get_top_cpu_processes(limit: int = 10) -> List[Dict[str, object]]:
-    return _get_linux_processes("-pcpu", limit)
+    return powershell_json_array(
+        "$interval = 0.5; $before = @{}; "
+        "Get-Process -ErrorAction SilentlyContinue | Where-Object { $null -ne $_.CPU } | "
+        "ForEach-Object { $before[$_.Id] = $_.CPU }; "
+        "Start-Sleep -Milliseconds 500; "
+        "Get-Process -ErrorAction SilentlyContinue | Where-Object { $before.ContainsKey($_.Id) -and $null -ne $_.CPU } | "
+        "ForEach-Object { [PSCustomObject]@{ProcessName=$_.ProcessName; Id=$_.Id; CpuPercent=[math]::Round((($_.CPU - $before[$_.Id]) / $interval / [Environment]::ProcessorCount) * 100, 1); WorkingSetMB=[math]::Round($_.WorkingSet64 / 1MB, 1)} } | "
+        f"Sort-Object CpuPercent -Descending | Select-Object -First {limit} | ConvertTo-Json -Compress"
+    )
 
 
 def get_top_memory_processes(limit: int = 10) -> List[Dict[str, object]]:
-    return _get_linux_processes("-rss", limit)
+    return powershell_json_array(
+        "Get-Process -ErrorAction SilentlyContinue | "
+        "Sort-Object WorkingSet64 -Descending | "
+        f"Select-Object -First {limit} ProcessName,Id,@{{Name='WorkingSetMB';Expression={{[math]::Round($_.WorkingSet64 / 1MB, 1)}}}},@{{Name='PagedMemoryMB';Expression={{[math]::Round($_.PagedMemorySize64 / 1MB, 1)}}}},Handles | "
+        "ConvertTo-Json -Compress"
+    )
 
 
-def get_linux_processes(limit: int = 100) -> List[Dict[str, object]]:
-    return _get_linux_processes("pid", limit)
+def get_windows_processes(limit: int = 100) -> List[Dict[str, object]]:
+    return powershell_json_array(
+        "Get-Process -ErrorAction SilentlyContinue | "
+        "Sort-Object Id | "
+        f"Select-Object -First {limit} ProcessName,Id,CPU,@{{Name='WorkingSetMB';Expression={{[math]::Round($_.WorkingSet64 / 1MB, 1)}}}},Handles | "
+        "ConvertTo-Json -Compress"
+    )
 
 
 @dataclass
-class LinuxConnection:
+class WindowsConnection:
     protocol: str
     local_address: str
     local_port: int
@@ -462,7 +542,7 @@ class LinuxConnection:
 
 
 @dataclass(frozen=True)
-class LinuxDnsServer:
+class WindowsDnsServer:
     interface_alias: str
     address: str
 
@@ -478,37 +558,29 @@ class ConnectionFilters:
     port_filters: List[str] = field(default_factory=list)
 
 
-def get_linux_connections() -> List[LinuxConnection]:
-    def parse_endpoint(value: str) -> Tuple[str, int]:
-        if value in {"*", "*:*"}:
-            return "0.0.0.0", 0
-        if value.startswith("["):
-            address, _, port = value[1:].rpartition("]:")
-        else:
-            address, _, port = value.rpartition(":")
+def get_windows_connections() -> List[WindowsConnection]:
+    values = powershell_json_array(
+        "$tcp = Get-NetTCPConnection -ErrorAction SilentlyContinue | "
+        "Where-Object { $_.State -ne 'Listen' } | "
+        "ForEach-Object { [PSCustomObject]@{Protocol='TCP';LocalAddress=$_.LocalAddress;LocalPort=$_.LocalPort;RemoteAddress=$_.RemoteAddress;RemotePort=$_.RemotePort;State=$_.State;OwningProcess=$_.OwningProcess} }; "
+        "$udp = Get-NetUDPEndpoint -ErrorAction SilentlyContinue | "
+        "ForEach-Object { [PSCustomObject]@{Protocol='UDP';LocalAddress=$_.LocalAddress;LocalPort=$_.LocalPort;RemoteAddress='0.0.0.0';RemotePort=0;State='ACTIVE';OwningProcess=$_.OwningProcess} }; "
+        "@($tcp) + @($udp) | ConvertTo-Json -Compress"
+    )
+    connections: List[WindowsConnection] = []
+    for value in values:
         try:
-            return address or "0.0.0.0", int(port)
-        except ValueError:
-            return address or "0.0.0.0", 0
-
-    output = run_command(["ss", "-H", "-tunap"])
-    connections: List[LinuxConnection] = []
-    for line in output.splitlines():
-        parts = line.split(maxsplit=5)
-        if len(parts) < 5 or parts[0].lower() not in {"tcp", "udp"}:
-            continue
-        try:
-            protocol, state = parts[0].upper(), parts[1].upper()
-            if protocol == "TCP" and state == "LISTEN":
-                continue
-            local_address, local_port = parse_endpoint(parts[4])
-            remote_address, remote_port = parse_endpoint(parts[5].split()[0] if len(parts) > 5 else "0.0.0.0:0")
-            pid_match = re.search(r"pid=(\d+)", parts[5] if len(parts) > 5 else "")
-            owning_process = int(pid_match.group(1)) if pid_match else 0
-        except (IndexError, ValueError):
+            protocol = str(value["Protocol"])
+            local_address = str(value["LocalAddress"])
+            local_port = int(value["LocalPort"])
+            remote_address = str(value["RemoteAddress"])
+            remote_port = int(value["RemotePort"])
+            state = str(value["State"])
+            owning_process = int(value["OwningProcess"])
+        except (KeyError, TypeError, ValueError):
             continue
         connections.append(
-            LinuxConnection(
+            WindowsConnection(
                 protocol=protocol,
                 local_address=local_address,
                 local_port=local_port,
@@ -521,16 +593,25 @@ def get_linux_connections() -> List[LinuxConnection]:
     return sorted(connections, key=lambda item: (item.protocol, item.local_address, item.local_port, item.remote_address))
 
 
-def get_linux_dns_servers() -> List[LinuxDnsServer]:
-    servers: List[LinuxDnsServer] = []
-    try:
-        lines = Path("/etc/resolv.conf").read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return []
-    for line in lines:
-        parts = line.split()
-        if len(parts) == 2 and parts[0] == "nameserver" and _looks_like_ipv4(parts[1]):
-            servers.append(LinuxDnsServer(interface_alias="system", address=parts[1]))
+def get_windows_dns_servers() -> List[WindowsDnsServer]:
+    values = powershell_json_array(
+        "Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | "
+        "Where-Object { $_.ServerAddresses } | "
+        "Select-Object InterfaceAlias,ServerAddresses | ConvertTo-Json -Compress"
+    )
+    servers: List[WindowsDnsServer] = []
+    for value in values:
+        interface_alias = value.get("InterfaceAlias")
+        addresses = value.get("ServerAddresses")
+        if not isinstance(interface_alias, str):
+            continue
+        if isinstance(addresses, str):
+            addresses = [addresses]
+        if not isinstance(addresses, list):
+            continue
+        for address in addresses:
+            if isinstance(address, str) and _looks_like_ipv4(address):
+                servers.append(WindowsDnsServer(interface_alias=interface_alias, address=address))
     return sorted(set(servers), key=lambda item: (item.interface_alias.lower(), ipaddress.IPv4Address(item.address)))
 
 
@@ -540,13 +621,13 @@ class AsaCli:
         self.enabled = False
         self.config_submode = "exec"
         self.username = getpass.getuser()
-        self.base_interfaces = parse_linux_interfaces()
+        self.base_interfaces = parse_ipconfig()
         self.interfaces = self._build_emulated_interfaces(self.base_interfaces)
         self.current_interface: Optional[str] = None
         self.static_routes: List[StaticRoute] = self._build_default_routes()
         self.history: List[str] = []
         self._last_input_width = 0
-        self.config_path = Path.cwd() / ".asa-cli-emulator-linux-config.json"
+        self.config_path = Path.cwd() / ".asa-cli-emulator-config.json"
         self.startup_config_text: Optional[str] = None
         self.user_tree, self.enabled_tree, self.config_tree, self.interface_tree = self._build_command_trees()
         self._load_saved_config()
@@ -574,11 +655,11 @@ class AsaCli:
             live_method = "DHCP" if (interface.dhcp_enabled or "").lower() == "yes" else "manual"
             mapped[asa_name.lower()] = EmulatedInterface(
                 asa_name=asa_name,
-                linux_name=interface.name,
+                windows_name=interface.name,
                 mac_address=interface.mac_address,
                 live_ipv4=live_ip,
                 live_method=live_method,
-                description=f"Linux adapter: {interface.name}",
+                description=f"Windows adapter: {interface.name}",
                 dhcp_enabled=live_method == "DHCP",
                 shutdown=interface.status == "administratively down",
             )
@@ -729,19 +810,19 @@ class AsaCli:
             self._set_help(root, ["show", "processes", "cpu-usage"], "Display sampled CPU utilization by process")
             self._set_help(root, ["show", "processes", "cpu-hog"], "Display processes using the most sampled CPU")
             self._set_help(root, ["show", "processes", "memory"], "Display process memory allocation")
-            self._set_help(root, ["show", "processes", "internals"], "Display Linux process details")
+            self._set_help(root, ["show", "processes", "internals"], "Display Windows process details")
             self._add_command(root, ["show", "conn"], "Display active TCP and UDP connections", self._show_connections)
             self._add_command(root, ["show", "conn", "count"], "Display active connection counts", self._show_conn_count)
             self._set_help(root, ["show", "conn", "all"], "Display all discovered connections")
-            self._set_help(root, ["show", "conn", "detail"], "Include Linux connection details")
+            self._set_help(root, ["show", "conn", "detail"], "Include Windows connection details")
             self._set_help(root, ["show", "conn", "long"], "Display expanded endpoint information")
             self._set_help(root, ["show", "conn", "state"], "Filter by connection state")
             self._set_help(root, ["show", "conn", "protocol"], "Filter by TCP or UDP")
             self._set_help(root, ["show", "conn", "address"], "Filter by an endpoint address or address range")
             self._set_help(root, ["show", "conn", "port"], "Filter by an endpoint port or port range")
-            self._add_command(root, ["show", "dns"], "Display Linux DNS resolver configuration", self._show_dns)
+            self._add_command(root, ["show", "dns"], "Display Windows DNS resolver configuration", self._show_dns)
             self._set_help(root, ["show", "dns", "trusted-source"], "Display configured DNS servers")
-            self._set_help(root, ["show", "dns", "trusted-source", "detail"], "Include Linux adapter names")
+            self._set_help(root, ["show", "dns", "trusted-source", "detail"], "Include Windows adapter names")
             self._add_command(root, ["show", "running-config"], "Current operating configuration", self._show_running_config)
             self._add_command(root, ["show", "running-config", "interface"], "Interface configuration", self._show_running_interfaces)
             self._add_command(root, ["show", "running-config", "route"], "Static route configuration", self._show_running_routes)
@@ -809,77 +890,66 @@ class AsaCli:
                 break
 
     def _read_line(self) -> str:
-        if not sys.stdin.isatty() or termios is None or tty is None:
+        if not sys.stdin.isatty() or msvcrt is None:
             return input(self.prompt)
 
-        return self._read_line_posix()
-
-    def _read_line_posix(self) -> str:
-        """Read a POSIX terminal line with interactive editing and completion."""
-        file_descriptor = sys.stdin.fileno()
-        original_settings = termios.tcgetattr(file_descriptor)
         buffer = ""
         cursor = 0
         history_index = len(self.history)
         print(self.prompt, end="", flush=True)
         self._last_input_width = len(self.prompt)
-
-        try:
-            tty.setraw(file_descriptor)
-            while True:
-                char = os.read(file_descriptor, 1).decode("utf-8", errors="ignore")
-                if char in ("\r", "\n"):
-                    print()
-                    if buffer.strip() and (not self.history or self.history[-1] != buffer):
-                        self.history.append(buffer)
-                    return buffer
-                if char == "\t":
-                    buffer, cursor = self._handle_tab(buffer, cursor)
-                    continue
-                if char in ("\b", "\x7f"):
-                    if cursor > 0:
-                        buffer = buffer[: cursor - 1] + buffer[cursor:]
-                        cursor -= 1
-                        self._redraw_input(buffer, cursor)
-                    continue
-                if char == "\x03":
-                    raise KeyboardInterrupt
-                if char == "\x1b":
-                    sequence = os.read(file_descriptor, 2).decode("utf-8", errors="ignore")
-                    if sequence == "[A" and self.history:
-                        history_index = max(0, history_index - 1)
-                        buffer = self.history[history_index]
-                        cursor = len(buffer)
-                        self._redraw_input(buffer, cursor)
-                    elif sequence == "[B" and self.history:
-                        history_index = min(len(self.history), history_index + 1)
-                        buffer = "" if history_index == len(self.history) else self.history[history_index]
-                        cursor = len(buffer)
-                        self._redraw_input(buffer, cursor)
-                    elif sequence == "[D" and cursor > 0:
-                        cursor -= 1
+        while True:
+            char = msvcrt.getwch()
+            if char in ("\r", "\n"):
+                print()
+                if buffer.strip() and (not self.history or self.history[-1] != buffer):
+                    self.history.append(buffer)
+                return buffer
+            if char == "\t":
+                buffer, cursor = self._handle_tab(buffer, cursor)
+                continue
+            if char in ("\b", "\x7f"):
+                if cursor > 0:
+                    buffer = buffer[: cursor - 1] + buffer[cursor:]
+                    cursor -= 1
+                    self._redraw_input(buffer, cursor)
+                continue
+            if char == "\x03":
+                raise KeyboardInterrupt
+            if char in ("\x00", "\xe0"):
+                key = msvcrt.getwch()
+                if key == "H" and self.history:
+                    history_index = max(0, history_index - 1)
+                    buffer = self.history[history_index]
+                    cursor = len(buffer)
+                    self._redraw_input(buffer, cursor)
+                elif key == "P" and self.history:
+                    history_index = min(len(self.history), history_index + 1)
+                    buffer = "" if history_index == len(self.history) else self.history[history_index]
+                    cursor = len(buffer)
+                    self._redraw_input(buffer, cursor)
+                elif key == "K" and cursor > 0:
+                    cursor -= 1
+                    print("\b", end="", flush=True)
+                elif key == "M" and cursor < len(buffer):
+                    print(buffer[cursor], end="", flush=True)
+                    cursor += 1
+                elif key == "S" and cursor < len(buffer):
+                    buffer = buffer[:cursor] + buffer[cursor + 1:]
+                    self._redraw_input(buffer, cursor)
+                elif key == "G":
+                    while cursor > 0:
                         print("\b", end="", flush=True)
-                    elif sequence == "[C" and cursor < len(buffer):
+                        cursor -= 1
+                elif key == "O":
+                    while cursor < len(buffer):
                         print(buffer[cursor], end="", flush=True)
                         cursor += 1
-                    elif sequence == "[H":
-                        cursor = 0
-                        self._redraw_input(buffer, cursor)
-                    elif sequence == "[F":
-                        cursor = len(buffer)
-                        self._redraw_input(buffer, cursor)
-                    elif sequence == "[3":
-                        os.read(file_descriptor, 1)
-                        if cursor < len(buffer):
-                            buffer = buffer[:cursor] + buffer[cursor + 1:]
-                            self._redraw_input(buffer, cursor)
-                    continue
-                if char.isprintable():
-                    buffer = buffer[:cursor] + char + buffer[cursor:]
-                    cursor += len(char)
-                    self._redraw_input(buffer, cursor)
-        finally:
-            termios.tcsetattr(file_descriptor, termios.TCSADRAIN, original_settings)
+                continue
+            if char.isprintable():
+                buffer = buffer[:cursor] + char + buffer[cursor:]
+                cursor += len(char)
+                self._redraw_input(buffer, cursor)
 
     def _redraw_input(self, buffer: str, cursor: int) -> None:
         line = self.prompt + buffer
@@ -1227,7 +1297,7 @@ class AsaCli:
         return 0 <= start <= end <= 65535
 
     def _handle_diagnostic_command(self, line: str) -> bool:
-        """Run bounded Linux diagnostics through ASA-style EXEC commands."""
+        """Run bounded Windows diagnostics through ASA-style EXEC commands."""
         words = line.split()
         if not words:
             return False
@@ -1292,7 +1362,7 @@ class AsaCli:
         if parsed is None:
             return
         host, repeat = parsed
-        output = run_command(["ping", "-c", str(repeat), host])
+        output = run_command(["ping", "-n", str(repeat), host])
         if output:
             print(output)
 
@@ -1301,10 +1371,7 @@ class AsaCli:
         if parsed is None:
             return
         host, hops = parsed
-        command = ["traceroute", "-n", "-m", str(hops), "-w", "1", host]
-        if not shutil.which("traceroute"):
-            command = ["tracepath", "-n", host]
-        output = run_command(command)
+        output = run_command(["tracert", "-d", "-h", str(hops), "-w", "1000", host])
         if output:
             print(output)
 
@@ -1441,12 +1508,21 @@ class AsaCli:
         print("% Incomplete command.")
 
     def _apply_interface_admin_state(self, interface: EmulatedInterface, enabled: bool) -> bool:
-        action = "up" if enabled else "down"
+        action = "enabled" if enabled else "disabled"
         if not self._ensure_admin():
             return False
-        ok, output = run_live_command(["ip", "link", "set", "dev", interface.linux_name, action])
+        ok, output = run_live_command(
+            [
+                "netsh",
+                "interface",
+                "set",
+                "interface",
+                f"name={interface.windows_name}",
+                f"admin={action}",
+            ]
+        )
         if not ok:
-            self._print_linux_error(output)
+            self._print_windows_error(output)
         else:
             self._refresh_live_state()
         return ok
@@ -1454,17 +1530,22 @@ class AsaCli:
     def _apply_static_ip(self, interface: EmulatedInterface, ip_address: str, mask: str) -> bool:
         if not self._ensure_admin():
             return False
-        prefix_length = mask_to_prefix(mask)
-        if prefix_length is None:
-            print("% Invalid IP netmask.")
-            return False
-        ok, output = run_live_command(["ip", "-4", "addr", "flush", "dev", interface.linux_name])
-        if ok:
-            ok, output = run_live_command(
-                ["ip", "-4", "addr", "add", f"{ip_address}/{prefix_length}", "dev", interface.linux_name]
-            )
+        ok, output = run_live_command(
+            [
+                "netsh",
+                "interface",
+                "ipv4",
+                "set",
+                "address",
+                f"name={interface.windows_name}",
+                "static",
+                ip_address,
+                mask,
+                "none",
+            ]
+        )
         if not ok:
-            self._print_linux_error(output)
+            self._print_windows_error(output)
         else:
             self._refresh_live_state()
         return ok
@@ -1472,12 +1553,19 @@ class AsaCli:
     def _apply_dhcp_ip(self, interface: EmulatedInterface) -> bool:
         if not self._ensure_admin():
             return False
-        if not shutil.which("dhclient"):
-            print("% DHCP client unavailable. Install dhclient or configure the interface through your network manager.")
-            return False
-        ok, output = run_live_command(["dhclient", "-1", interface.linux_name])
+        ok, output = run_live_command(
+            [
+                "netsh",
+                "interface",
+                "ipv4",
+                "set",
+                "address",
+                f"name={interface.windows_name}",
+                "dhcp",
+            ]
+        )
         if not ok:
-            self._print_linux_error(output)
+            self._print_windows_error(output)
         else:
             self._refresh_live_state()
         return ok
@@ -1490,42 +1578,49 @@ class AsaCli:
         if not self._ensure_admin():
             return False
 
-        destination = "default" if route.destination == "0.0.0.0" and prefix_length == 0 else f"{route.destination}/{prefix_length}"
-        command = ["ip", "route", "del" if negate else "replace", destination]
-        if route.gateway != "0.0.0.0":
-            command.extend(["via", route.gateway])
-        command.extend(["dev", interface.linux_name])
+        action = "delete" if negate else "add"
+        command = [
+            "netsh",
+            "interface",
+            "ipv4",
+            action,
+            "route",
+            f"prefix={route.destination}/{prefix_length}",
+            f"interface={interface.windows_name}",
+            f"nexthop={route.gateway}",
+            "store=persistent",
+        ]
         if not negate:
-            command.extend(["metric", str(route.metric)])
+            command.insert(-1, f"metric={route.metric}")
 
         ok, output = run_live_command(command)
         if not ok:
-            self._print_linux_error(output)
+            self._print_windows_error(output)
         else:
             self._refresh_live_state()
         return ok
 
     def _refresh_live_state(self) -> None:
-        discovered = parse_linux_interfaces()
+        discovered = parse_ipconfig()
         if not discovered:
             return
 
-        existing_by_linux_name = {
-            interface.linux_name.lower(): interface
+        existing_by_windows_name = {
+            interface.windows_name.lower(): interface
             for interface in self.interfaces.values()
         }
         refreshed: Dict[str, EmulatedInterface] = {}
         for index, discovered_interface in enumerate(discovered, start=1):
-            existing = existing_by_linux_name.get(discovered_interface.name.lower())
+            existing = existing_by_windows_name.get(discovered_interface.name.lower())
             if existing is None:
                 asa_name = self._asa_interface_name(index, discovered_interface.name)
                 existing = EmulatedInterface(
                     asa_name=asa_name,
-                    linux_name=discovered_interface.name,
+                    windows_name=discovered_interface.name,
                     mac_address=discovered_interface.mac_address,
                     live_ipv4=None,
                     live_method="manual",
-                    description=f"Linux adapter: {discovered_interface.name}",
+                    description=f"Windows adapter: {discovered_interface.name}",
                 )
 
             existing.mac_address = discovered_interface.mac_address
@@ -1543,13 +1638,13 @@ class AsaCli:
     def _ensure_admin() -> bool:
         if is_admin():
             return True
-        print("% Linux administrator privileges are required to apply this command.")
-        print("% Restart the emulator with sudo or as root and try again.")
+        print("% Windows administrator privileges are required to apply this command.")
+        print("% Restart PowerShell as Administrator and run the emulator again.")
         return False
 
     @staticmethod
-    def _print_linux_error(output: str) -> None:
-        print("% Linux rejected the live network change.")
+    def _print_windows_error(output: str) -> None:
+        print("% Windows rejected the live network change.")
         if output:
             print(output)
 
@@ -1744,7 +1839,7 @@ class AsaCli:
                     if len(words) == 3 and self._matches(words[2], "state") and trailing_space:
                         print("  up             Display established TCP and active UDP connections")
                         print("  tcp-embryonic  Display TCP connections awaiting handshake completion")
-                        print("  <state,...>    Filter by one or more comma-separated Linux connection states")
+                        print("  <state,...>    Filter by one or more comma-separated Windows connection states")
                         return True
                     if len(words) == 3 and self._matches(words[2], "address") and trailing_space:
                         print("  <ip[-ip]>  Match either endpoint by an IP address or address range")
@@ -1756,7 +1851,7 @@ class AsaCli:
                     if len(words) == 2 and trailing_space:
                         print("  cpu-usage  Display sampled CPU utilization by process")
                         print("  cpu-hog    Display processes using the most sampled CPU")
-                        print("  internals  Display Linux process details")
+                        print("  internals  Display Windows process details")
                         print("  memory     Display process memory allocation")
                         return True
                     if len(words) == 3 and self._matches(words[2], "cpu-usage") and trailing_space:
@@ -1764,7 +1859,7 @@ class AsaCli:
                         print("  sorted    Sort processes by sampled CPU utilization")
                         return True
                 if status == "ok" and subject in {"cpu", "memory", "mem"} and len(words) == 2 and trailing_space:
-                    print("  detail  Include top Linux process utilization")
+                    print("  detail  Include top Windows process utilization")
                     return True
                 if status == "ok" and subject in {"cpu", "memory", "mem"} and len(words) == 3 and self._matches(words[2], "detail") and trailing_space:
                     print("  <1-100>  Number of top processes to display")
@@ -1803,12 +1898,12 @@ class AsaCli:
     def _print_interface_name_help(self) -> None:
         width = max((len(interface.asa_name) for interface in self.interfaces.values()), default=0) + 2
         for interface in self.interfaces.values():
-            print(f"  {interface.asa_name.ljust(width)}{interface.linux_name}")
+            print(f"  {interface.asa_name.ljust(width)}{interface.windows_name}")
 
     def _print_route_interface_help(self) -> None:
         width = max((len(interface.asa_name) for interface in self.interfaces.values()), default=0) + 2
         for interface in self.interfaces.values():
-            label = interface.nameif or interface.linux_name
+            label = interface.nameif or interface.windows_name
             print(f"  {interface.asa_name.ljust(width)}Route out via {label}")
 
     @staticmethod
@@ -1952,7 +2047,7 @@ class AsaCli:
                 if self._apply_interface_admin_state(interface, enabled=True):
                     interface.shutdown = False
             elif self._matches(target, "description"):
-                interface.description = f"Linux adapter: {interface.linux_name}"
+                interface.description = f"Windows adapter: {interface.windows_name}"
             elif self._matches(target, "nameif"):
                 interface.nameif = None
             elif self._matches(target, "security-level"):
@@ -1996,14 +2091,14 @@ class AsaCli:
                 return self._display_interface_name(interface)
         return interface_ip
 
-    def _interface_name_for_linux_name(self, linux_name: str) -> str:
+    def _interface_name_for_windows_name(self, windows_name: str) -> str:
         for interface in self.interfaces.values():
-            if interface.linux_name.lower() == linux_name.lower():
+            if interface.windows_name.lower() == windows_name.lower():
                 return self._display_interface_name(interface)
-        return linux_name or "Unknown"
+        return windows_name or "Unknown"
 
     @staticmethod
-    def _is_interesting_connected_route(route: LinuxRoute) -> bool:
+    def _is_interesting_connected_route(route: WindowsRoute) -> bool:
         if route.gateway.lower() != "on-link":
             return False
         if route.destination.startswith("127.") or route.destination.startswith("224."):
@@ -2097,12 +2192,12 @@ class AsaCli:
         print(self.hostname)
 
     def _show_version(self) -> None:
-        print("Cisco Adaptive Security Appliance Software Version 9.18(Linux-Emulated)")
+        print("Cisco Adaptive Security Appliance Software Version 9.18(Windows-Emulated)")
         print("Device Manager Version 7.20(1)")
         print()
         print(f"Hostname: {self.hostname}")
         print(f"Username: {self.username}")
-        print(f"Linux OS: {get_os_caption()}")
+        print(f"Windows OS: {get_os_caption()}")
         print(f"Kernel: {platform.release()} ({platform.version()})")
         print(f"Architecture: {platform.machine()}")
         print(f"Uptime: {get_uptime_string()}")
@@ -2110,7 +2205,7 @@ class AsaCli:
         print(f"Compiled on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
     def _show_inventory(self) -> None:
-        print(f'NAME: "{self.hostname}", DESCR: "Linux ASA CLI Emulator Host"')
+        print(f'NAME: "{self.hostname}", DESCR: "Windows ASA CLI Emulator Host"')
         print(f'PID: {get_model()}, VID: 1.0, SN: {get_serial_number()}')
         print()
         print(f'MANUFACTURER: {get_manufacturer()}')
@@ -2209,10 +2304,10 @@ class AsaCli:
 
     def _show_route(self) -> None:
         print("Codes: C - connected, S - static, S* - candidate default")
-        linux_routes = get_linux_ipv4_routes()
+        windows_routes = get_windows_ipv4_routes()
         printed_routes = set()
 
-        for route in linux_routes:
+        for route in windows_routes:
             if self._is_interesting_connected_route(route):
                 interface_name = self._interface_name_for_route_ip(route.interface_ip)
                 key = ("C", route.destination, route.mask, interface_name)
@@ -2234,7 +2329,7 @@ class AsaCli:
                 f"[1/{route.metric}] via {route.gateway}, {route.interface_name}"
             )
 
-        for route in linux_routes:
+        for route in windows_routes:
             if route.gateway.lower() == "on-link":
                 continue
             if route.destination.startswith("127.") or route.destination.startswith("224."):
@@ -2255,7 +2350,7 @@ class AsaCli:
         print(":")
         print(f": Generated by Python ASA CLI emulator on {datetime.now().isoformat(sep=' ', timespec='seconds')}")
         print(":")
-        print("ASA Version 9.18(Linux-Emulated)")
+        print("ASA Version 9.18(Windows-Emulated)")
         print(f"hostname {self.hostname}")
         print(f"domain-name {get_domain()}")
         print("enable password ***** encrypted")
@@ -2265,7 +2360,7 @@ class AsaCli:
         print(f"clock timezone LOCAL {datetime.now().astimezone().tzname() or 'LOCAL'}")
         print(f"username {self.username} privilege 15")
         print("!")
-        print(f"! Linux host: {get_os_caption()}")
+        print(f"! Windows host: {get_os_caption()}")
         print(f"! Manufacturer: {get_manufacturer()}")
         print(f"! Model: {get_model()}")
         print(f"! Serial: {get_serial_number()}")
@@ -2321,7 +2416,7 @@ class AsaCli:
     def _show_clock_detail(self) -> None:
         now = datetime.now().astimezone()
         print(now.strftime("%H:%M:%S.%f")[:-3] + " " + now.tzname() + " " + now.strftime("%a %b %d %Y"))
-        print(f"Time source is Linux system clock")
+        print(f"Time source is Windows system clock")
         print(f"UTC offset is {now.strftime('%z')}")
 
     def _show_startup_config(self) -> None:
@@ -2332,7 +2427,7 @@ class AsaCli:
 
     def _show_module_detail(self) -> None:
         print('Mod  Card Type                                    Model              Serial No.')
-        print(f'1    Linux ASA CLI Emulator Host                {get_model()[:18]:18} {get_serial_number()}')
+        print(f'1    Windows ASA CLI Emulator Host                {get_model()[:18]:18} {get_serial_number()}')
         print()
         print('Mod  MAC Address Range                 Hw Version   Fw Version   Sw Version')
         first_mac = next((interface.mac_address for interface in self.interfaces.values()), "unassigned")
@@ -2352,8 +2447,8 @@ class AsaCli:
         ip_address = interface.effective_ip() or "unassigned"
         mask = interface.configured_mask or ("DHCP" if interface.dhcp_enabled else "255.255.255.255")
         print(f"Interface {interface.asa_name} \"{self._display_interface_name(interface)}\", is {status}, line protocol is {protocol}")
-        print(f"  Linux adapter: {interface.linux_name}")
-        print("  Hardware is Linux adapter, BW 1000000 Kbit, DLY 10 usec")
+        print(f"  Windows adapter: {interface.windows_name}")
+        print("  Hardware is Windows adapter, BW 1000000 Kbit, DLY 10 usec")
         print(f"  Description: {interface.description}")
         print(f"  MAC address {interface.mac_address}, MTU 1500")
         print(f"  IP address {ip_address}, subnet mask {mask}")
@@ -2371,10 +2466,10 @@ class AsaCli:
             print(f"  {self._display_interface_name(interface):18} {ip_address:15} {method}")
 
     def _show_route_summary(self) -> None:
-        linux_routes = get_linux_ipv4_routes()
-        connected = sum(1 for route in linux_routes if self._is_interesting_connected_route(route))
+        windows_routes = get_windows_ipv4_routes()
+        connected = sum(1 for route in windows_routes if self._is_interesting_connected_route(route))
         static = sum(1 for route in self.static_routes if route.metric != 0)
-        static += sum(1 for route in linux_routes if route.gateway.lower() != "on-link")
+        static += sum(1 for route in windows_routes if route.gateway.lower() != "on-link")
         print("Route Source    Networks    Subnets     Overhead    Memory (bytes)")
         print(f"connected       {connected:<11}0           0           {connected * 128}")
         print(f"static          {static:<11}0           0           {static * 128}")
@@ -2382,19 +2477,19 @@ class AsaCli:
 
     def _show_arp(self) -> None:
         print("Protocol  Address          Age (min)  Hardware Addr   Type  Interface")
-        entries = get_linux_arp_entries()
+        entries = get_windows_arp_entries()
         if not entries:
             print("No ARP entries discovered")
             return
 
         for entry in entries:
             mac_address = f"{entry.mac_address[:4]}.{entry.mac_address[4:8]}.{entry.mac_address[8:]}"
-            interface_name = self._interface_name_for_linux_name(entry.interface_alias)
+            interface_name = self._interface_name_for_windows_name(entry.interface_alias)
             entry_type = "ARPA" if entry.state.lower() != "permanent" else "ARPA static"
             print(f"Internet  {entry.address:15}  -          {mac_address:14}  {entry_type:11} {interface_name}")
 
     def _show_conn_count(self) -> None:
-        connections = get_linux_connections()
+        connections = get_windows_connections()
         tcp_count = sum(1 for connection in connections if connection.protocol == "TCP")
         udp_count = sum(1 for connection in connections if connection.protocol == "UDP")
         print(f"{len(connections)} in use, {len(connections)} most used")
@@ -2422,10 +2517,10 @@ class AsaCli:
         print("      Inspect: dns, packet 0, drop 0, reset-drop 0")
 
     def _show_processes(self) -> None:
-        processes = get_linux_processes()
+        processes = get_windows_processes()
         print("PC         Thread     STATE       Runtime    SBASE     Stack Process")
         if not processes:
-            print("Linux process information unavailable")
+            print("Windows process information unavailable")
             return
         for process in processes:
             name = str(process.get("ProcessName", "Unknown"))
@@ -2443,7 +2538,7 @@ class AsaCli:
 
         print("PC         Thread       5Sec     1Min     5Min   Process")
         if not processes:
-            print("No Linux processes matched the CPU utilization filter")
+            print("No Windows processes matched the CPU utilization filter")
             return
         for process in processes:
             name = str(process.get("ProcessName", "Unknown"))
@@ -2456,7 +2551,7 @@ class AsaCli:
             process for process in get_top_cpu_processes(20)
             if float(process.get("CpuPercent", 0) or 0) > 0
         ]
-        print("CPU hog statistics (Linux sampled CPU equivalent):")
+        print("CPU hog statistics (Windows sampled CPU equivalent):")
         print("Process                          PID      CPU%")
         if not processes:
             print("No processes reported sampled CPU utilization")
@@ -2468,10 +2563,10 @@ class AsaCli:
             )
 
     def _show_processes_internals(self) -> None:
-        processes = get_linux_processes()
+        processes = get_windows_processes()
         print("Process                          PID  Handles  Working Set")
         if not processes:
-            print("Linux process information unavailable")
+            print("Windows process information unavailable")
             return
         for process in processes:
             name = str(process.get("ProcessName", "Unknown"))
@@ -2520,7 +2615,7 @@ class AsaCli:
         return lower <= port <= upper
 
     @staticmethod
-    def _connection_matches_state(connection: LinuxConnection, state: str) -> bool:
+    def _connection_matches_state(connection: WindowsConnection, state: str) -> bool:
         requested = state.lower().replace("-", "")
         actual = connection.state.lower().replace("-", "")
         if requested == "up":
@@ -2529,7 +2624,7 @@ class AsaCli:
             return actual in {"synsent", "synreceived"}
         return actual == requested
 
-    def _connection_matches_filters(self, connection: LinuxConnection, filters: ConnectionFilters) -> bool:
+    def _connection_matches_filters(self, connection: WindowsConnection, filters: ConnectionFilters) -> bool:
         if filters.protocols and connection.protocol not in filters.protocols:
             return False
         if filters.states and not any(self._connection_matches_state(connection, state) for state in filters.states):
@@ -2542,7 +2637,7 @@ class AsaCli:
         return True
 
     @staticmethod
-    def _connection_flags(connection: LinuxConnection) -> str:
+    def _connection_flags(connection: WindowsConnection) -> str:
         if connection.protocol == "UDP":
             return "U"
         if connection.state.lower() == "established":
@@ -2554,12 +2649,12 @@ class AsaCli:
     def _show_connections(self, filters: Optional[ConnectionFilters] = None) -> None:
         filters = filters or ConnectionFilters()
         connections = [
-            connection for connection in get_linux_connections()
+            connection for connection in get_windows_connections()
             if self._connection_matches_filters(connection, filters)
         ]
         print(f"{len(connections)} in use, {len(connections)} most used")
         if not connections:
-            print("No Linux connections matched the requested filters")
+            print("No Windows connections matched the requested filters")
             return
 
         displayed = connections if filters.show_all else connections[:100]
@@ -2572,20 +2667,20 @@ class AsaCli:
                 f"state {connection.state}, flags {self._connection_flags(connection)}, pid {connection.owning_process}"
             )
             if filters.detail or filters.long_format:
-                print(f"  Local interface: {interface_name}; Linux state: {connection.state}; owning PID: {connection.owning_process}")
+                print(f"  Local interface: {interface_name}; Windows state: {connection.state}; owning PID: {connection.owning_process}")
             if filters.detail:
-                print(f"  Local endpoint: {local}; remote endpoint: {remote}; traffic counters: unavailable from Linux snapshot")
+                print(f"  Local endpoint: {local}; remote endpoint: {remote}; traffic counters: unavailable from Windows snapshot")
         if not filters.show_all and len(connections) > len(displayed):
             print(f"... {len(connections) - len(displayed)} additional connections omitted; use 'show conn all'")
 
     def _show_dns(self, detail: bool = False) -> None:
-        servers = get_linux_dns_servers()
+        servers = get_windows_dns_servers()
         print("Trusted DNS source configuration:")
         if not servers:
             print("  No IPv4 DNS servers are configured")
             return
         for server in servers:
-            interface_name = self._interface_name_for_linux_name(server.interface_alias)
+            interface_name = self._interface_name_for_windows_name(server.interface_alias)
             if detail:
                 print(f"  {server.address:15} interface {interface_name} ({server.interface_alias})")
             else:
@@ -2617,7 +2712,7 @@ class AsaCli:
         print(f"%ASA-6-302013: Built emulated management connection for user {self.username}")
         print("%ASA-6-302014: Teardown emulated management connection")
         print("%ASA-5-111008: User executed the show tech-support command")
-        print("%ASA-4-411001: Line protocol state changes are reflected from Linux adapters")
+        print("%ASA-4-411001: Line protocol state changes are reflected from Windows adapters")
         print("%ASA-6-199013: Emulator diagnostic collection complete")
 
     def _show_resource_usage(self) -> None:
@@ -2641,7 +2736,7 @@ class AsaCli:
 
     def _show_asp_drop(self) -> None:
         print("Frame drop:")
-        print("  No ASP drop counters are available in the Linux emulator")
+        print("  No ASP drop counters are available in the Windows emulator")
 
     def _show_environment(self) -> None:
         print("Power Supply: N/A")
@@ -2665,7 +2760,7 @@ class AsaCli:
 
     def _show_tech_bundle(self, include_sensitive: bool) -> None:
         print("Cisco Adaptive Security Appliance show tech-support")
-        print("Output captured by ASA CLI emulator for Linux")
+        print("Output captured by ASA CLI emulator for Windows")
         print(f"Generated: {datetime.now().astimezone().isoformat(sep=' ', timespec='seconds')}")
         print("Passwords and secret values are removed by default.")
 
@@ -2745,9 +2840,8 @@ class AsaCli:
 
 
 def main() -> int:
-    if not sys.platform.startswith("linux"):
-        print("This emulator is intended for Linux hosts.")
-        return 1
+    if os.name != "nt":
+        print("This emulator is intended for Windows hosts.")
     cli = AsaCli()
     try:
         cli.cmdloop()
