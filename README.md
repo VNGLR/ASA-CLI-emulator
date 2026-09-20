@@ -24,6 +24,8 @@ Linux support expects `ip` and `ss` from `iproute2`, plus `ps` from `procps`. DH
 
 Read-only commands work without elevation. Commands such as `shutdown`, `no shutdown`, `ip address`, and `route` require Administrator/root privileges and apply to the selected host interface immediately.
 
+The Windows version also provides `port tester <hostname-or-ip> <port>`, which uses the built-in `ftp` client to test TCP reachability. For example: `port tester google.com 443`.
+
 ## Live Configuration
 
 The following commands affect the host:

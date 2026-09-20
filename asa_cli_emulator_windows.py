@@ -37,6 +37,26 @@ def run_command(command: List[str]) -> str:
         return f"Unable to run {' '.join(command)}: {exc}"
 
 
+def run_ftp_port_test(host: str, port: int) -> str:
+    """Use Windows FTP's open command as a TCP reachability probe."""
+    try:
+        completed = subprocess.run(
+            ["ftp", "-n"],
+            input=f"open {host} {port}\nquit\n",
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            check=False,
+        )
+        return (completed.stdout or completed.stderr or "").strip()
+    except subprocess.TimeoutExpired:
+        return "FTP port test timed out."
+    except OSError as exc:
+        return f"Unable to run ftp: {exc}"
+
+
 def run_live_command(command: List[str]) -> Tuple[bool, str]:
     try:
         completed = subprocess.run(
@@ -794,6 +814,8 @@ class AsaCli:
             self._set_help(root, ["traceroute"], "Trace the route to a destination")
             self._set_help(root, ["trace"], "Trace route commands")
             self._set_help(root, ["trace", "route"], "Trace the route to a destination")
+            self._set_help(root, ["port"], "TCP port testing commands")
+            self._set_help(root, ["port", "tester"], "Test a TCP port with the Windows FTP client")
             self._add_command(root, ["show", "cpu"], "Display processor utilization", self._show_cpu)
             self._add_command(root, ["show", "cpu", "detail"], "Display detailed processor utilization", self._show_cpu_detail)
             self._add_command(root, ["show", "memory"], "Display memory utilization", self._show_memory)
@@ -1306,6 +1328,15 @@ class AsaCli:
             self._run_ping(words[1:])
             return True
 
+        if words[0].lower() == "port":
+            if len(words) == 1:
+                print("% Incomplete command.")
+                return True
+            if self._matches(words[1], "tester"):
+                self._run_port_tester(words[2:])
+                return True
+            return False
+
         # Check the two-word alias before traceroute: "trace" is a valid
         # abbreviation of "traceroute" and would otherwise capture it.
         if words[0].lower() == "trace" and len(words) >= 2 and self._matches(words[1], "route"):
@@ -1374,6 +1405,37 @@ class AsaCli:
         output = run_command(["tracert", "-d", "-h", str(hops), "-w", "1000", host])
         if output:
             print(output)
+
+    def _run_port_tester(self, arguments: List[str]) -> None:
+        if len(arguments) < 2:
+            print("% Incomplete command.")
+            return
+        if len(arguments) > 2:
+            print("% Invalid input detected at '^' marker.")
+            return
+
+        host, port_text = arguments
+        if not self._valid_diagnostic_host(host):
+            print("% Invalid destination.")
+            return
+        try:
+            port = int(port_text)
+        except ValueError:
+            print("% Port must be a whole number between 1 and 65535.")
+            return
+        if not 1 <= port <= 65535:
+            print("% Port must be a whole number between 1 and 65535.")
+            return
+
+        output = run_ftp_port_test(host, port)
+        if output:
+            print(output)
+        # Non-FTP services commonly close the control socket immediately after
+        # accepting it, which Windows FTP reports as a remote-host close.
+        if re.search(r"connected to\s+|connection closed by remote host", output, flags=re.IGNORECASE):
+            print(f"Port {port} on {host} is reachable.")
+        elif not output.lower().startswith("unable to run ftp"):
+            print(f"Port {port} on {host} is not reachable.")
 
     @staticmethod
     def _parse_process_limit(value: str) -> Optional[int]:
@@ -1803,6 +1865,14 @@ class AsaCli:
                 return True
             if len(words) == argument_index + 1 and trailing_space:
                 print("  <1-30>            Maximum hops (default: 10)")
+                return True
+
+        if words and words[0].lower() == "port" and len(words) >= 2 and self._matches(words[1], "tester"):
+            if len(words) == 2 and trailing_space:
+                print("  <hostname-or-ip>  Destination to test")
+                return True
+            if len(words) == 3 and trailing_space:
+                print("  <1-65535>         TCP port to test with Windows FTP")
                 return True
 
         if len(words) >= 2 and self._matches(words[0], "show"):
