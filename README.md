@@ -20,13 +20,17 @@ Run the Linux version with `sudo` when using commands that change networking:
 sudo python3 ./asa_cli_emulator.py
 ```
 
-Linux support expects `ip` and `ss` from `iproute2`, plus `ps` from `procps`. DHCP configuration also needs `dhclient` when that command is used.
+Linux support expects `ip` and `ss` from `iproute2`, plus `ps` from `procps`. DHCP configuration also needs `dhclient` when that command is used. Linux `packet-tracer` additionally requires `tcpdump`; `nft` is optional for passive Netfilter trace output.
 
 Read-only commands work without elevation. Commands such as `shutdown`, `no shutdown`, `ip address`, and `route` require Administrator/root privileges and apply to the selected host interface immediately.
 
 Both versions provide `port tester <hostname-or-ip> <port>`, which uses Python's built-in TCP socket support to test reachability without an external client. For example: `port tester google.com 443`.
 
-The Windows version also provides `packet-tracer input <interface> <tcp|udp> <source-ip> <source-port> <destination-ip> <destination-port> [detailed]`. It requires Administrator privileges, clears existing PktMon filters, captures only the specified destination protocol/port while generating the probe, then prints a temporary decoded capture. Do not run it while another PktMon investigation is active.
+Both versions provide `packet-tracer input <interface> <tcp|udp> <source-ip> <source-port> <destination-ip> <destination-port> [detailed]`. The supplied source IP must belong to the host, or the generated probe cannot bind to it.
+
+On Windows it requires Administrator privileges, clears existing PktMon filters, captures only the specified destination protocol/port while generating the probe, then prints a temporary decoded capture. Do not run it while another PktMon investigation is active.
+
+On Linux it requires `sudo` and `tcpdump`, and prints the route decision, socket snapshots, a scoped decoded `tcpdump` capture, and any trace events already emitted by the active nftables ruleset. It does not add nftables rules, run host-wide `dropwatch`, or run `bpftrace` automatically.
 
 ## Live Configuration
 

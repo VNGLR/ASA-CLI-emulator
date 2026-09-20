@@ -52,6 +52,76 @@ def run_tcp_port_test(host: str, port: int) -> Tuple[bool, str]:
         return False, f"TCP connection to {host}:{port} failed: {exc}"
 
 
+def run_linux_packet_tracer_probe(
+    protocol: str,
+    source_address: str,
+    source_port: int,
+    destination_address: str,
+    destination_port: int,
+) -> Tuple[bool, str]:
+    """Generate the TCP or UDP traffic recorded by the Linux packet trace."""
+    socket_type = socket.SOCK_STREAM if protocol == "tcp" else socket.SOCK_DGRAM
+    try:
+        with socket.socket(socket.AF_INET, socket_type) as probe:
+            probe.settimeout(5)
+            probe.bind((source_address, source_port))
+            if protocol == "tcp":
+                probe.connect((destination_address, destination_port))
+            else:
+                probe.sendto(b"ASA packet-tracer probe", (destination_address, destination_port))
+        return True, f"Generated {protocol.upper()} probe to {destination_address}:{destination_port}."
+    except socket.timeout:
+        return False, f"{protocol.upper()} probe to {destination_address}:{destination_port} timed out."
+    except OSError as exc:
+        return False, f"{protocol.upper()} probe failed: {exc}"
+
+
+def start_linux_packet_capture(
+    interface_name: str, protocol: str, destination_address: str, destination_port: int, detailed: bool
+) -> subprocess.Popen:
+    expression = f"{protocol} and host {destination_address} and port {destination_port}"
+    command = ["tcpdump", "-nn", "-l"]
+    if detailed:
+        command.append("-vvv")
+    command.extend(["-i", interface_name, "--", expression])
+    return subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+
+def start_nft_trace_monitor() -> subprocess.Popen:
+    return subprocess.Popen(
+        ["nft", "monitor", "trace"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+
+def stop_linux_capture_process(process: subprocess.Popen) -> str:
+    process.terminate()
+    try:
+        output, _ = process.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        output, _ = process.communicate()
+    return (output or "").strip()
+
+
+def get_linux_packet_tracer_socket_snapshot(destination_address: str, destination_port: int) -> str:
+    output = run_command(["ss", "-H", "-tnu"])
+    port_marker = f":{destination_port}"
+    matching_lines = [line for line in output.splitlines() if destination_address in line or port_marker in line]
+    return "\n".join(matching_lines)
+
+
 def run_live_command(command: List[str]) -> Tuple[bool, str]:
     try:
         completed = subprocess.run(
@@ -728,6 +798,8 @@ class AsaCli:
             self._set_help(root, ["trace", "route"], "Trace the route to a destination")
             self._set_help(root, ["port"], "TCP port testing commands")
             self._set_help(root, ["port", "tester"], "Test a TCP port with a socket connection")
+            self._set_help(root, ["packet-tracer"], "Capture and trace a generated packet")
+            self._set_help(root, ["packet-tracer", "input"], "Specify packet-tracer input parameters")
             self._add_command(root, ["show", "cpu"], "Display processor utilization", self._show_cpu)
             self._add_command(root, ["show", "cpu", "detail"], "Display detailed processor utilization", self._show_cpu_detail)
             self._add_command(root, ["show", "memory"], "Display memory utilization", self._show_memory)
@@ -1265,6 +1337,15 @@ class AsaCli:
                 return True
             return False
 
+        if words[0].lower() == "packet-tracer":
+            if len(words) == 1:
+                print("% Incomplete command.")
+                return True
+            if self._matches(words[1], "input"):
+                self._run_packet_tracer(words[2:])
+                return True
+            return False
+
         # Check the two-word alias before traceroute: "trace" is a valid
         # abbreviation of "traceroute" and would otherwise capture it.
         if words[0].lower() == "trace" and len(words) >= 2 and self._matches(words[1], "route"):
@@ -1365,6 +1446,118 @@ class AsaCli:
             print(f"Port {port} on {host} is reachable.")
         else:
             print(f"Port {port} on {host} is not reachable.")
+
+    def _run_packet_tracer(self, arguments: List[str]) -> None:
+        parsed = self._parse_packet_tracer_arguments(arguments)
+        if parsed is None:
+            return
+        interface, protocol, source_address, source_port, destination_address, destination_port, detailed = parsed
+
+        if not self._ensure_admin():
+            return
+        if not shutil.which("tcpdump"):
+            print("% tcpdump is required for Linux packet-tracer capture.")
+            return
+
+        print(f"packet-tracer input {interface.asa_name} {protocol} {source_address} {source_port} {destination_address} {destination_port}")
+        print("Phase: 1")
+        print("Type: Linux route lookup")
+        route_command = ["ip", "route", "get", destination_address]
+        if source_address != "0.0.0.0":
+            route_command.extend(["from", source_address])
+        route_output = run_command(route_command)
+        print(route_output or "Route lookup returned no output.")
+
+        socket_before = get_linux_packet_tracer_socket_snapshot(destination_address, destination_port)
+        print("Phase: 2")
+        print("Type: Socket state before probe")
+        print(socket_before or "No matching sockets before probe.")
+
+        try:
+            tcpdump_process = start_linux_packet_capture(
+                interface.linux_name, protocol, destination_address, destination_port, detailed
+            )
+        except OSError as exc:
+            print(f"% Unable to start tcpdump capture: {exc}")
+            return
+
+        nft_process: Optional[subprocess.Popen] = None
+        nft_warning = ""
+        if shutil.which("nft"):
+            try:
+                nft_process = start_nft_trace_monitor()
+            except OSError as exc:
+                nft_warning = f"Unable to start nft monitor trace: {exc}"
+        else:
+            nft_warning = "nft is not installed; Netfilter trace output is unavailable."
+
+        time.sleep(0.25)
+        probe_succeeded = False
+        try:
+            probe_succeeded, probe_output = run_linux_packet_tracer_probe(
+                protocol, source_address, source_port, destination_address, destination_port
+            )
+            print(probe_output)
+            socket_after = get_linux_packet_tracer_socket_snapshot(destination_address, destination_port)
+        finally:
+            tcpdump_output = stop_linux_capture_process(tcpdump_process)
+            nft_output = stop_linux_capture_process(nft_process) if nft_process is not None else ""
+
+        print("Phase: 3")
+        print("Type: Socket state after probe")
+        print(socket_after or "No matching sockets after probe.")
+        print("Result: CAPTURE COMPLETE" if probe_succeeded else "Result: DROP")
+
+        print("Phase: 4")
+        print("Type: tcpdump decoded capture")
+        print(tcpdump_output or "No matching packets were recorded.")
+        print("Phase: 5")
+        print("Type: Netfilter trace monitor")
+        if nft_output:
+            print(nft_output)
+        elif nft_warning:
+            print(nft_warning)
+        else:
+            print("No nft trace events were emitted by the active ruleset.")
+
+    def _parse_packet_tracer_arguments(
+        self, arguments: List[str]
+    ) -> Optional[Tuple[EmulatedInterface, str, str, int, str, int, bool]]:
+        if len(arguments) < 6:
+            print("% Incomplete command.")
+            return None
+        if len(arguments) > 7:
+            print("% Invalid input detected at '^' marker.")
+            return None
+
+        interface_key = self._resolve_interface_name(arguments[0])
+        if interface_key is None:
+            print("% Invalid input detected at '^' marker.")
+            return None
+        protocol = arguments[1].lower()
+        if protocol not in {"tcp", "udp"}:
+            print("% Protocol must be tcp or udp.")
+            return None
+        try:
+            source_address = str(ipaddress.IPv4Address(arguments[2]))
+            source_port = int(arguments[3])
+            destination_address = str(ipaddress.IPv4Address(arguments[4]))
+            destination_port = int(arguments[5])
+        except ValueError:
+            print("% Source and destination must be IPv4 addresses with numeric ports.")
+            return None
+        if not 0 <= source_port <= 65535 or not 1 <= destination_port <= 65535:
+            print("% Source port must be 0-65535 and destination port must be 1-65535.")
+            return None
+
+        detailed = len(arguments) == 7 and self._matches(arguments[6], "detailed")
+        if len(arguments) == 7 and not detailed:
+            print("% Optional packet-tracer argument must be detailed.")
+            return None
+        return (
+            self.interfaces[interface_key], protocol, source_address, source_port,
+            destination_address, destination_port, detailed,
+        )
 
     @staticmethod
     def _parse_process_limit(value: str) -> Optional[int]:
@@ -1617,6 +1810,19 @@ class AsaCli:
         if show_completion is not None:
             return show_completion
 
+        if (
+            len(words) >= 2
+            and words[0].lower() == "packet-tracer"
+            and self._matches(words[1], "input")
+        ):
+            return self._complete_value_command(
+                buffer,
+                words,
+                trailing_space,
+                self._interface_completion_names(),
+                offset=1,
+            )
+
         if self.config_submode == "config":
             if words and self._matches(words[0], "interface"):
                 return self._complete_value_command(buffer, words, trailing_space, self._interface_completion_names())
@@ -1775,6 +1981,24 @@ class AsaCli:
                 return True
             if len(words) == 3 and trailing_space:
                 print("  <1-65535>         TCP port to test with a socket connection")
+                return True
+
+        if words and words[0].lower() == "packet-tracer" and len(words) >= 2 and self._matches(words[1], "input"):
+            argument_index = 2
+            help_entries = [
+                "  <interface>         ASA interface to identify the trace input",
+                "  <tcp|udp>           Transport protocol to generate",
+                "  <source-ip>         Local IPv4 address to bind",
+                "  <source-port>       Source port (0 selects an ephemeral port)",
+                "  <destination-ip>    IPv4 destination to capture",
+                "  <destination-port>  Destination TCP or UDP port",
+                "  detailed            Use verbose tcpdump output",
+            ]
+            if len(words) == argument_index and trailing_space:
+                print(help_entries[0])
+                return True
+            if argument_index <= len(words) - 1 < argument_index + len(help_entries) and trailing_space:
+                print(help_entries[len(words) - argument_index])
                 return True
 
         if len(words) >= 2 and self._matches(words[0], "show"):

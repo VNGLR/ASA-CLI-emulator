@@ -1,11 +1,13 @@
 import io
 import os
+import socket
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from unittest.mock import MagicMock, patch
 
-from asa_cli_emulator import AsaCli, InterfaceInfo, LinuxArpEntry, LinuxConnection, LinuxDnsServer, run_tcp_port_test
+from asa_cli_emulator import AsaCli, InterfaceInfo, LinuxArpEntry, LinuxConnection, LinuxDnsServer, run_linux_packet_tracer_probe, run_tcp_port_test, start_linux_packet_capture
 
 
 def sample_linux_interfaces():
@@ -45,6 +47,12 @@ class LinuxAsaCliTests(unittest.TestCase):
         self.assertEqual("show run interface GigabitEthernet", completed)
         self.assertEqual(2, len(suggestions))
 
+    def test_packet_tracer_interface_completion_uses_canonical_prefix(self):
+        self.cli._cmd_enable()
+        completed, suggestions = self.cli._complete_line("packet-tracer input gig")
+        self.assertEqual("packet-tracer input GigabitEthernet", completed)
+        self.assertEqual(2, len(suggestions))
+
     def test_raw_terminal_newline_resets_the_cursor_column(self):
         output = io.StringIO()
         with redirect_stdout(output):
@@ -75,6 +83,57 @@ class LinuxAsaCliTests(unittest.TestCase):
         with patch("asa_cli_emulator.socket.create_connection", return_value=connection) as connect:
             self.assertEqual((True, "TCP connection to example.com:443 succeeded."), run_tcp_port_test("example.com", 443))
         connect.assert_called_once_with(("example.com", 443), timeout=5)
+
+    def test_packet_tracer_collects_tcpdump_and_netfilter_diagnostics(self):
+        tcpdump_process = MagicMock()
+        nft_process = MagicMock()
+
+        def which(command):
+            return {"tcpdump": "/usr/sbin/tcpdump", "nft": "/usr/sbin/nft"}.get(command)
+
+        with patch("asa_cli_emulator.is_admin", return_value=True):
+            with patch("asa_cli_emulator.shutil.which", side_effect=which):
+                with patch("asa_cli_emulator.run_command", return_value="route via 10.0.0.1"):
+                    with patch("asa_cli_emulator.get_linux_packet_tracer_socket_snapshot", side_effect=["before socket", "after socket"]):
+                        with patch("asa_cli_emulator.start_linux_packet_capture", return_value=tcpdump_process) as start_capture:
+                            with patch("asa_cli_emulator.start_nft_trace_monitor", return_value=nft_process):
+                                with patch("asa_cli_emulator.run_linux_packet_tracer_probe", return_value=(True, "Generated TCP probe.")) as probe:
+                                    with patch("asa_cli_emulator.stop_linux_capture_process", side_effect=["tcpdump packet", "nft trace event"]) as stop:
+                                        with patch("asa_cli_emulator.time.sleep"):
+                                            output = io.StringIO()
+                                            with redirect_stdout(output):
+                                                self.cli._dispatch_line("packet-tracer input GigabitEthernet1/0 tcp 10.0.0.10 0 198.51.100.1 443 detailed")
+        start_capture.assert_called_once_with("eth0", "tcp", "198.51.100.1", 443, True)
+        probe.assert_called_once_with("tcp", "10.0.0.10", 0, "198.51.100.1", 443)
+        self.assertEqual(tcpdump_process, stop.call_args_list[0].args[0])
+        self.assertEqual(nft_process, stop.call_args_list[1].args[0])
+        rendered = output.getvalue()
+        self.assertIn("tcpdump packet", rendered)
+        self.assertIn("nft trace event", rendered)
+
+    def test_linux_packet_tracer_probe_binds_source_and_connects_tcp(self):
+        probe_socket = MagicMock()
+        with patch("asa_cli_emulator.socket.socket", return_value=probe_socket) as create_socket:
+            self.assertEqual(
+                (True, "Generated TCP probe to 198.51.100.1:443."),
+                run_linux_packet_tracer_probe("tcp", "10.0.0.10", 12345, "198.51.100.1", 443),
+            )
+        create_socket.assert_called_once_with(socket.AF_INET, socket.SOCK_STREAM)
+        probe_socket.__enter__.return_value.bind.assert_called_once_with(("10.0.0.10", 12345))
+        probe_socket.__enter__.return_value.connect.assert_called_once_with(("198.51.100.1", 443))
+
+    def test_linux_packet_capture_uses_scoped_tcpdump_filter(self):
+        process = MagicMock()
+        with patch("asa_cli_emulator.subprocess.Popen", return_value=process) as popen:
+            self.assertEqual(process, start_linux_packet_capture("eth0", "tcp", "198.51.100.1", 443, True))
+        popen.assert_called_once_with(
+            ["tcpdump", "-nn", "-l", "-vvv", "-i", "eth0", "--", "tcp and host 198.51.100.1 and port 443"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
 
     def test_show_arp_maps_linux_device_to_asa_interface(self):
         entries = [LinuxArpEntry("192.0.2.1", "001122334455", "REACHABLE", "eth0")]
