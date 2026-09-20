@@ -26,6 +26,8 @@ Read-only commands work without elevation. Commands such as `shutdown`, `no shut
 
 Both versions provide `port tester <hostname-or-ip> <port>`, which uses Python's built-in TCP socket support to test reachability without an external client. For example: `port tester google.com 443`.
 
+The Windows version also provides `packet-tracer input <interface> <tcp|udp> <source-ip> <source-port> <destination-ip> <destination-port> [detailed]`. It requires Administrator privileges, clears existing PktMon filters, captures only the specified destination protocol/port while generating the probe, then prints a temporary decoded capture. Do not run it while another PktMon investigation is active.
+
 ## Live Configuration
 
 The following commands affect the host:
@@ -76,6 +78,7 @@ ping example.com 3
 traceroute 192.0.2.1
 trace route example.com 8
 port tester google.com 443
+packet-tracer input GigabitEthernet1/0 tcp 10.0.0.10 12345 198.51.100.1 443 detailed
 show system > system.txt
 show startup-config
 show tech-support

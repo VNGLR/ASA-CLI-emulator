@@ -1,12 +1,13 @@
 import io
 import os
+import socket
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from asa_cli_emulator_windows import AsaCli, InterfaceInfo, StaticRoute, WindowsArpEntry, WindowsConnection, WindowsDnsServer, run_tcp_port_test
+from asa_cli_emulator_windows import AsaCli, InterfaceInfo, StaticRoute, WindowsArpEntry, WindowsConnection, WindowsDnsServer, run_packet_tracer_probe, run_tcp_port_test
 
 
 def sample_interfaces():
@@ -58,6 +59,12 @@ class AsaCliTests(unittest.TestCase):
         self.assertEqual("show run interface GigabitEthernet", completed)
         self.assertEqual(2, len(suggestions))
 
+    def test_packet_tracer_interface_completion_uses_canonical_prefix(self):
+        self.cli._cmd_enable()
+        completed, suggestions = self.cli._complete_line("packet-tracer input gig")
+        self.assertEqual("packet-tracer input GigabitEthernet", completed)
+        self.assertEqual(2, len(suggestions))
+
     def test_ping_invokes_windows_ping_with_repeat_count(self):
         with patch("asa_cli_emulator_windows.run_command", return_value="Ping reply") as run:
             output = io.StringIO()
@@ -93,6 +100,46 @@ class AsaCliTests(unittest.TestCase):
         with patch("asa_cli_emulator_windows.socket.create_connection", return_value=connection) as connect:
             self.assertEqual((True, "TCP connection to example.com:443 succeeded."), run_tcp_port_test("example.com", 443))
         connect.assert_called_once_with(("example.com", 443), timeout=5)
+
+    def test_packet_tracer_captures_and_prints_decoded_pktmon_output(self):
+        pktmon_results = [
+            (True, "filters cleared"),
+            (True, "filter added"),
+            (True, "capture started"),
+            (True, "counter output"),
+            (True, "capture stopped"),
+            (True, "capture converted"),
+            (True, "filters removed"),
+        ]
+        with patch("asa_cli_emulator_windows.is_admin", return_value=True):
+            with patch("asa_cli_emulator_windows.shutil.which", return_value="C:/Windows/System32/pktmon.exe"):
+                with patch("asa_cli_emulator_windows.run_live_command", side_effect=pktmon_results) as run:
+                    with patch("asa_cli_emulator_windows.run_packet_tracer_probe", return_value=(True, "Generated TCP probe.")) as probe:
+                        with patch("asa_cli_emulator_windows.Path.read_text", return_value="Decoded PktMon packet"):
+                            output = io.StringIO()
+                            with redirect_stdout(output):
+                                self.cli._dispatch_line("packet-tracer input GigabitEthernet1/0 tcp 10.0.0.10 12345 198.51.100.1 443 detailed")
+        probe.assert_called_once_with("tcp", "10.0.0.10", 12345, "198.51.100.1", 443)
+        self.assertEqual(["pktmon", "filter", "remove"], run.call_args_list[0].args[0])
+        self.assertEqual(
+            ["pktmon", "filter", "add", "AsaPacketTracer", "-t", "TCP", "-i", "198.51.100.1", "-p", "443"],
+            run.call_args_list[1].args[0],
+        )
+        self.assertEqual(["pktmon", "counters"], run.call_args_list[3].args[0])
+        self.assertEqual(["pktmon", "stop"], run.call_args_list[4].args[0])
+        self.assertEqual(["pktmon", "filter", "remove"], run.call_args_list[6].args[0])
+        self.assertIn("Decoded PktMon packet", output.getvalue())
+
+    def test_packet_tracer_probe_binds_source_and_connects_tcp(self):
+        probe_socket = MagicMock()
+        with patch("asa_cli_emulator_windows.socket.socket", return_value=probe_socket) as create_socket:
+            self.assertEqual(
+                (True, "Generated TCP probe to 198.51.100.1:443."),
+                run_packet_tracer_probe("tcp", "10.0.0.10", 12345, "198.51.100.1", 443),
+            )
+        create_socket.assert_called_once_with(socket.AF_INET, socket.SOCK_STREAM)
+        probe_socket.__enter__.return_value.bind.assert_called_once_with(("10.0.0.10", 12345))
+        probe_socket.__enter__.return_value.connect.assert_called_once_with(("198.51.100.1", 443))
 
     def test_show_arp_renders_windows_neighbor_with_asa_interface_name(self):
         entries = [WindowsArpEntry("192.0.2.1", "001122334455", "Reachable", "Ethernet")]
