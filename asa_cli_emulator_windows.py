@@ -37,24 +37,17 @@ def run_command(command: List[str]) -> str:
         return f"Unable to run {' '.join(command)}: {exc}"
 
 
-def run_ftp_port_test(host: str, port: int) -> str:
-    """Use Windows FTP's open command as a TCP reachability probe."""
+def run_tcp_port_test(host: str, port: int) -> Tuple[bool, str]:
+    """Open and immediately close a TCP socket to test service reachability."""
     try:
-        completed = subprocess.run(
-            ["ftp", "-n"],
-            input=f"open {host} {port}\nquit\n",
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=15,
-            check=False,
-        )
-        return (completed.stdout or completed.stderr or "").strip()
-    except subprocess.TimeoutExpired:
-        return "FTP port test timed out."
+        with socket.create_connection((host, port), timeout=5):
+            return True, f"TCP connection to {host}:{port} succeeded."
+    except socket.gaierror:
+        return False, f"Unable to resolve {host}."
+    except socket.timeout:
+        return False, f"TCP connection to {host}:{port} timed out."
     except OSError as exc:
-        return f"Unable to run ftp: {exc}"
+        return False, f"TCP connection to {host}:{port} failed: {exc}"
 
 
 def run_live_command(command: List[str]) -> Tuple[bool, str]:
@@ -815,7 +808,7 @@ class AsaCli:
             self._set_help(root, ["trace"], "Trace route commands")
             self._set_help(root, ["trace", "route"], "Trace the route to a destination")
             self._set_help(root, ["port"], "TCP port testing commands")
-            self._set_help(root, ["port", "tester"], "Test a TCP port with the Windows FTP client")
+            self._set_help(root, ["port", "tester"], "Test a TCP port with a socket connection")
             self._add_command(root, ["show", "cpu"], "Display processor utilization", self._show_cpu)
             self._add_command(root, ["show", "cpu", "detail"], "Display detailed processor utilization", self._show_cpu_detail)
             self._add_command(root, ["show", "memory"], "Display memory utilization", self._show_memory)
@@ -1427,14 +1420,12 @@ class AsaCli:
             print("% Port must be a whole number between 1 and 65535.")
             return
 
-        output = run_ftp_port_test(host, port)
+        reachable, output = run_tcp_port_test(host, port)
         if output:
             print(output)
-        # Non-FTP services commonly close the control socket immediately after
-        # accepting it, which Windows FTP reports as a remote-host close.
-        if re.search(r"connected to\s+|connection closed by remote host", output, flags=re.IGNORECASE):
+        if reachable:
             print(f"Port {port} on {host} is reachable.")
-        elif not output.lower().startswith("unable to run ftp"):
+        else:
             print(f"Port {port} on {host} is not reachable.")
 
     @staticmethod
@@ -1872,7 +1863,7 @@ class AsaCli:
                 print("  <hostname-or-ip>  Destination to test")
                 return True
             if len(words) == 3 and trailing_space:
-                print("  <1-65535>         TCP port to test with Windows FTP")
+                print("  <1-65535>         TCP port to test with a socket connection")
                 return True
 
         if len(words) >= 2 and self._matches(words[0], "show"):

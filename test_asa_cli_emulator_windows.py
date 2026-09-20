@@ -4,9 +4,9 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, patch
 
-from asa_cli_emulator_windows import AsaCli, InterfaceInfo, StaticRoute, WindowsArpEntry, WindowsConnection, WindowsDnsServer, run_ftp_port_test
+from asa_cli_emulator_windows import AsaCli, InterfaceInfo, StaticRoute, WindowsArpEntry, WindowsConnection, WindowsDnsServer, run_tcp_port_test
 
 
 def sample_interfaces():
@@ -74,19 +74,12 @@ class AsaCliTests(unittest.TestCase):
         run.assert_called_once_with(["tracert", "-d", "-h", "8", "-w", "1000", "example.com"])
         self.assertIn("Trace output", output.getvalue())
 
-    def test_port_tester_uses_windows_ftp_open(self):
-        with patch("asa_cli_emulator_windows.run_ftp_port_test", return_value="Connected to google.com.") as run:
+    def test_port_tester_uses_tcp_socket(self):
+        with patch("asa_cli_emulator_windows.run_tcp_port_test", return_value=(True, "TCP connection succeeded.")) as run:
             output = io.StringIO()
             with redirect_stdout(output):
                 self.cli._dispatch_line("port tester google.com 443")
         run.assert_called_once_with("google.com", 443)
-        self.assertIn("Port 443 on google.com is reachable.", output.getvalue())
-
-    def test_port_tester_treats_remote_close_as_reachable(self):
-        with patch("asa_cli_emulator_windows.run_ftp_port_test", return_value="Connection closed by remote host."):
-            output = io.StringIO()
-            with redirect_stdout(output):
-                self.cli._dispatch_line("port tester google.com 443")
         self.assertIn("Port 443 on google.com is reachable.", output.getvalue())
 
     def test_port_tester_rejects_invalid_ports(self):
@@ -95,20 +88,11 @@ class AsaCliTests(unittest.TestCase):
             self.cli._dispatch_line("port tester example.com 70000")
         self.assertIn("Port must be a whole number between 1 and 65535.", output.getvalue())
 
-    def test_ftp_port_test_scripts_open_and_quit(self):
-        completed = Mock(stdout="Connected to example.com.", stderr="")
-        with patch("asa_cli_emulator_windows.subprocess.run", return_value=completed) as run:
-            self.assertEqual("Connected to example.com.", run_ftp_port_test("example.com", 443))
-        run.assert_called_once_with(
-            ["ftp", "-n"],
-            input="open example.com 443\nquit\n",
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=15,
-            check=False,
-        )
+    def test_tcp_port_test_uses_builtin_socket(self):
+        connection = MagicMock()
+        with patch("asa_cli_emulator_windows.socket.create_connection", return_value=connection) as connect:
+            self.assertEqual((True, "TCP connection to example.com:443 succeeded."), run_tcp_port_test("example.com", 443))
+        connect.assert_called_once_with(("example.com", 443), timeout=5)
 
     def test_show_arp_renders_windows_neighbor_with_asa_interface_name(self):
         entries = [WindowsArpEntry("192.0.2.1", "001122334455", "Reachable", "Ethernet")]

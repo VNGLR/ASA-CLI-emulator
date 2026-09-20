@@ -39,6 +39,19 @@ def run_command(command: List[str]) -> str:
         return f"Unable to run {' '.join(command)}: {exc}"
 
 
+def run_tcp_port_test(host: str, port: int) -> Tuple[bool, str]:
+    """Open and immediately close a TCP socket to test service reachability."""
+    try:
+        with socket.create_connection((host, port), timeout=5):
+            return True, f"TCP connection to {host}:{port} succeeded."
+    except socket.gaierror:
+        return False, f"Unable to resolve {host}."
+    except socket.timeout:
+        return False, f"TCP connection to {host}:{port} timed out."
+    except OSError as exc:
+        return False, f"TCP connection to {host}:{port} failed: {exc}"
+
+
 def run_live_command(command: List[str]) -> Tuple[bool, str]:
     try:
         completed = subprocess.run(
@@ -713,6 +726,8 @@ class AsaCli:
             self._set_help(root, ["traceroute"], "Trace the route to a destination")
             self._set_help(root, ["trace"], "Trace route commands")
             self._set_help(root, ["trace", "route"], "Trace the route to a destination")
+            self._set_help(root, ["port"], "TCP port testing commands")
+            self._set_help(root, ["port", "tester"], "Test a TCP port with a socket connection")
             self._add_command(root, ["show", "cpu"], "Display processor utilization", self._show_cpu)
             self._add_command(root, ["show", "cpu", "detail"], "Display detailed processor utilization", self._show_cpu_detail)
             self._add_command(root, ["show", "memory"], "Display memory utilization", self._show_memory)
@@ -1241,6 +1256,15 @@ class AsaCli:
             self._run_ping(words[1:])
             return True
 
+        if words[0].lower() == "port":
+            if len(words) == 1:
+                print("% Incomplete command.")
+                return True
+            if self._matches(words[1], "tester"):
+                self._run_port_tester(words[2:])
+                return True
+            return False
+
         # Check the two-word alias before traceroute: "trace" is a valid
         # abbreviation of "traceroute" and would otherwise capture it.
         if words[0].lower() == "trace" and len(words) >= 2 and self._matches(words[1], "route"):
@@ -1312,6 +1336,35 @@ class AsaCli:
         output = run_command(command)
         if output:
             print(output)
+
+    def _run_port_tester(self, arguments: List[str]) -> None:
+        if len(arguments) < 2:
+            print("% Incomplete command.")
+            return
+        if len(arguments) > 2:
+            print("% Invalid input detected at '^' marker.")
+            return
+
+        host, port_text = arguments
+        if not self._valid_diagnostic_host(host):
+            print("% Invalid destination.")
+            return
+        try:
+            port = int(port_text)
+        except ValueError:
+            print("% Port must be a whole number between 1 and 65535.")
+            return
+        if not 1 <= port <= 65535:
+            print("% Port must be a whole number between 1 and 65535.")
+            return
+
+        reachable, output = run_tcp_port_test(host, port)
+        if output:
+            print(output)
+        if reachable:
+            print(f"Port {port} on {host} is reachable.")
+        else:
+            print(f"Port {port} on {host} is not reachable.")
 
     @staticmethod
     def _parse_process_limit(value: str) -> Optional[int]:
@@ -1714,6 +1767,14 @@ class AsaCli:
                 return True
             if len(words) == argument_index + 1 and trailing_space:
                 print("  <1-30>            Maximum hops (default: 10)")
+                return True
+
+        if words and words[0].lower() == "port" and len(words) >= 2 and self._matches(words[1], "tester"):
+            if len(words) == 2 and trailing_space:
+                print("  <hostname-or-ip>  Destination to test")
+                return True
+            if len(words) == 3 and trailing_space:
+                print("  <1-65535>         TCP port to test with a socket connection")
                 return True
 
         if len(words) >= 2 and self._matches(words[0], "show"):

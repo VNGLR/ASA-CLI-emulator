@@ -24,7 +24,7 @@ Linux support expects `ip` and `ss` from `iproute2`, plus `ps` from `procps`. DH
 
 Read-only commands work without elevation. Commands such as `shutdown`, `no shutdown`, `ip address`, and `route` require Administrator/root privileges and apply to the selected host interface immediately.
 
-The Windows version also provides `port tester <hostname-or-ip> <port>`, which uses the built-in `ftp` client to test TCP reachability. For example: `port tester google.com 443`.
+Both versions provide `port tester <hostname-or-ip> <port>`, which uses Python's built-in TCP socket support to test reachability without an external client. For example: `port tester google.com 443`.
 
 ## Live Configuration
 
@@ -75,6 +75,7 @@ ping 192.0.2.1
 ping example.com 3
 traceroute 192.0.2.1
 trace route example.com 8
+port tester google.com 443
 show system > system.txt
 show startup-config
 show tech-support

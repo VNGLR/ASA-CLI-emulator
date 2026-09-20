@@ -3,9 +3,9 @@ import os
 import tempfile
 import unittest
 from contextlib import redirect_stdout
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
-from asa_cli_emulator import AsaCli, InterfaceInfo, LinuxArpEntry, LinuxConnection, LinuxDnsServer
+from asa_cli_emulator import AsaCli, InterfaceInfo, LinuxArpEntry, LinuxConnection, LinuxDnsServer, run_tcp_port_test
 
 
 def sample_linux_interfaces():
@@ -61,6 +61,20 @@ class LinuxAsaCliTests(unittest.TestCase):
             with patch("asa_cli_emulator.run_command", return_value="trace") as run:
                 self.cli._dispatch_line("trace route example.com 8")
         run.assert_called_once_with(["traceroute", "-n", "-m", "8", "-w", "1", "example.com"])
+
+    def test_port_tester_uses_tcp_socket(self):
+        with patch("asa_cli_emulator.run_tcp_port_test", return_value=(True, "TCP connection succeeded.")) as run:
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.cli._dispatch_line("port tester example.com 443")
+        run.assert_called_once_with("example.com", 443)
+        self.assertIn("Port 443 on example.com is reachable.", output.getvalue())
+
+    def test_tcp_port_test_uses_builtin_socket(self):
+        connection = MagicMock()
+        with patch("asa_cli_emulator.socket.create_connection", return_value=connection) as connect:
+            self.assertEqual((True, "TCP connection to example.com:443 succeeded."), run_tcp_port_test("example.com", 443))
+        connect.assert_called_once_with(("example.com", 443), timeout=5)
 
     def test_show_arp_maps_linux_device_to_asa_interface(self):
         entries = [LinuxArpEntry("192.0.2.1", "001122334455", "REACHABLE", "eth0")]
